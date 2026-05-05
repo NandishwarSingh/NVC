@@ -5,8 +5,9 @@ NVC is a custom neural video codec container with the `.nvc` file extension. Ver
 ## Design Goals
 
 - Use a native `.nvc` file type from day one.
-- Keep every `.nvc` self-contained.
-- Avoid embedding AV1, H.264, H.265, VP9, or MP4 video streams inside `.nvc` v0.
+- Keep every `.nvc` self-contained: model weights, color/grain/feature side data, and the base stream all live in one file.
+- The `BASE` chunk holds a single low-resolution coded video bitstream. The current alpha base codec (`BAS6`) wraps a libvpx-vp9 IVF bitstream produced via FFmpeg in CRF mode; older alpha base codecs (`BAS0`–`BAS5`) are read-only legacy formats.
+- Avoid embedding standard *container* formats (MP4, Matroska/WebM, etc.) inside `.nvc`. NVC defines its own chunked container.
 - Support two public profiles:
   - `NVC-W1`: realtime WebGPU playback target.
   - `NVC-XC`: slower encode, higher compression target.
@@ -180,7 +181,36 @@ delta = (byte - 128) * quant_step
 
 ## Alpha BASE Streams
 
-The current alpha encoder writes `BAS5`, a packetized custom Huffman entropy-coded motion-compensated tiled transform stream. The decoder still accepts older `BAS0`, `BAS1`, `BAS2`, `BAS3`, and `BAS4` files created by earlier milestones.
+The current alpha encoder writes `BAS6`, a libvpx-vp9 IVF bitstream produced via FFmpeg in CRF mode at the profile's downscaled resolution and codec frame rate. The decoder still accepts older `BAS0`, `BAS1`, `BAS2`, `BAS3`, `BAS4`, and `BAS5` files created by earlier milestones.
+
+### BAS6 VP9 IVF Stream
+
+`BAS6` contains a complete VP9 IVF bitstream produced by `libvpx-vp9` in CRF mode (`-crf X -b:v 0`). The header carries the dimensions, frame rate, and CRF used during encode so a decoder can either configure a software libvpx decoder or, in the browser, configure a WebCodecs `VideoDecoder('vp09.00.10.08')` and demux the IVF frames.
+
+```text
+offset  size  name
+0       4     magic = "BAS6"
+4       2     version = 6
+6       2     flags
+8       4     base width
+12      4     base height
+16      4     fps numerator
+20      4     fps denominator
+24      4     frame count
+28      8     raw YUV420 byte count (the source bytes the encoder fed in)
+36      8     coded VP9 IVF byte count
+44      4     libvpx-vp9 CRF value used at encode time
+48      4     target bitrate (kbps) when CRF is unused, otherwise 0
+52      4     reserved, must be 0
+56      N     VP9 IVF bitstream
+```
+
+Profile defaults:
+
+- `NVC-W1`: half-resolution base, 30 fps cap, libvpx-vp9 CRF 36.
+- `NVC-XC`: one-quarter-resolution base, 12 fps cap, libvpx-vp9 CRF 44.
+
+The IVF payload starts with the standard 32-byte IVF file header (`DKIF` magic, codec FourCC, dimensions, time base, frame count) followed by per-frame `[u32 length, u64 pts, length bytes]` records as defined by the IVF spec. Decoders may either feed the IVF bytes to `ffmpeg`/`libvpx-vp9` or demux frames manually and feed each frame's payload to a WebCodecs `VideoDecoder` as an `EncodedVideoChunk`.
 
 ### BAS0 Legacy RLE Stream
 
@@ -370,17 +400,17 @@ offset  size  name
 
 ### NVC-W1
 
-The web profile targets realtime playback. In alpha, 1080p sources are downscaled to a 540p base stream and coded at up to 30 fps.
+The web profile targets realtime playback. In alpha, 1080p sources are downscaled to a 540p VP9 base stream and coded at up to 30 fps with libvpx-vp9 CRF 36.
 
 ### NVC-XC
 
-The extreme compression profile allows slower encoding, lower base resolutions, lower coded frame rates, and heavier quantization. In alpha, it uses a one-sixth-resolution base stream, caps the coded stream at 12 fps, and stores only a tiny sampled preview.
+The extreme compression profile allows slower encoding, lower base resolutions, lower coded frame rates, and heavier quantization. In alpha, it uses a one-quarter-resolution VP9 base stream, caps the coded stream at 12 fps, encodes with libvpx-vp9 CRF 44, and stores only a tiny sampled preview. A 1920x1080 source becomes a 480x270 VP9 base stream.
 
 ## Future v0 Milestones
 
-- Improve `BAS5` motion search with variable vectors and sub-block decisions.
-- Replace byte-level Huffman with rANS/range coding if it beats `HUF0` on real clips.
-- Make `NVC-TinySR-v0` use full-resolution codec base packets for all playback frames.
+- Add a target-bitrate `BAS6` mode alongside CRF and make rate control per-profile tighter.
+- Make `NVC-TinySR-v0` (and a future ONNX SR model) use full-resolution VP9 base frames for all playback frames.
 - Improve `FET1` from luma tile residuals into richer learned feature residuals.
 - Tune `GRN1` from source/base statistics instead of fixed alpha defaults.
-- Extend packetized `BASE` GOP range loading into continuous playback buffering.
+- Extend `BAS6` browser playback from eager full-decode into HTTP-range streamed VP9 demux + WebCodecs.
+- Replace `realesr-animevideov3` with a smaller WebGPU ONNX SR model so the browser can match the CLI `--enhancer realesrgan` pipeline without ncnn-vulkan.

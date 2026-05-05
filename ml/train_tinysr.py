@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export", type=Path, default=Path("ml/exports/nvc-tinysr-v0.modl"))
     parser.add_argument("--train", action="store_true", help="Run PyTorch training before export")
     parser.add_argument("--source-video", type=Path, help="Train from a normal video file using FFmpeg-extracted frames")
+    parser.add_argument(
+        "--lr-video",
+        type=Path,
+        help="Per-clip distillation: paired low-resolution video (e.g. the VP9-decoded base from an .nvc round-trip). When provided, LR frames come from this file instead of being bicubically synthesised from --source-video. Lets the trained model see the actual codec degradation pattern of the encoded base.",
+    )
     parser.add_argument("--source-dir", type=Path, help="Train from every supported video file in a directory")
     parser.add_argument(
         "--source-list",
@@ -211,6 +216,8 @@ def train_with_torch(args: argparse.Namespace, metadata: dict, weights: list[flo
     metadata["trained"] = True
     metadata["training"] = {
         "source_video": str(args.source_video) if args.source_video else None,
+        "lr_video": str(args.lr_video) if args.lr_video else None,
+        "distilled_per_clip": args.lr_video is not None,
         "source_dir": str(args.source_dir) if args.source_dir else None,
         "source_list": str(args.source_list) if args.source_list else None,
         "video_sources": [str(path) for path in video_sources],
@@ -255,8 +262,25 @@ def make_training_batches(
             frame_limit = args.max_frames if args.source_video and len(video_sources) == 1 else args.frames_per_video
             hr_tensors.append(extract_video_tensor(path, frame_limit, args, torch))
         hr = torch.cat(hr_tensors, dim=0)
-        lr = functional.interpolate(hr, scale_factor=0.5, mode="bilinear", align_corners=False)
-        print(f"training corpus frames: {hr.shape[0]}")
+        if args.lr_video is not None:
+            # Per-clip distillation: LR is a real codec round-trip, not a bicubic of HR.
+            # Extract LR at half the HR training dims so the 2x SR ratio still holds.
+            saved_width = args.train_width
+            saved_height = args.train_height
+            args.train_width = saved_width // 2
+            args.train_height = saved_height // 2
+            lr_tensor = extract_video_tensor(args.lr_video, hr.shape[0], args, torch)
+            args.train_width = saved_width
+            args.train_height = saved_height
+            n = min(hr.shape[0], lr_tensor.shape[0])
+            if n == 0:
+                raise SystemExit("lr-video and source-video produced no overlapping frames")
+            hr = hr[:n]
+            lr = lr_tensor[:n]
+            print(f"distillation pairs: {n} (HR {tuple(hr.shape)} ⇄ LR {tuple(lr.shape)})")
+        else:
+            lr = functional.interpolate(hr, scale_factor=0.5, mode="bilinear", align_corners=False)
+            print(f"training corpus frames: {hr.shape[0]}")
         return batch_tensors(lr, hr, args.batch_size, device)
 
     pairs = list_tensor_pairs(args.dataset)

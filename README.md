@@ -1,6 +1,7 @@
 # NVC: Neural Video Codec
 
 ## By the numbers
+<<<<<<< HEAD
 
 Current alpha benchmark snapshots:
 
@@ -15,6 +16,24 @@ See [STATS.md](STATS.md) for methodology, exact commands, and the reproducibilit
 NVC is an experimental custom video codec with its own `.nvc` file type. The goal is to compress video by storing a small low-resolution base stream plus neural data that helps reconstruct a visually accurate full-resolution video.
 
 This repo is an alpha implementation. It already creates and reads native `.nvc` files, includes a Zig CLI, includes a browser demo, and lays down the format/spec structure for the neural codec work. New here? Start with [HOW_TO_SETUP_FROM_SCRATCH.md](HOW_TO_SETUP_FROM_SCRATCH.md).
+=======
+
+Current alpha benchmark snapshots:
+
+- **16 hours of 1024x576 natural video can fit in roughly 325 MB** at the measured XC rate of about 5.6 KB/s.
+- **21x smaller than a source MP4** on the WhatsApp test clip: 6.78 MB source to 314 KB `.nvc`.
+- **9x smaller W1 base stream** in the BAS5 to BAS6 transition benchmark, with VMAF around 85 on synthetic test content.
+- **+10.6 VMAF from `--enhancer realesrgan`** on W1 natural content in the FourPeople benchmark.
+- **12 fps base to 30 fps output** is supported with `--interpolate-rife` for smoother XC CLI decode.
+
+See [STATS.md](STATS.md) for methodology, exact commands, and the reproducibility script.
+
+NVC is an experimental neural-augmented video codec with its own `.nvc` file type. The goal is to compress video by storing a downscaled VP9 base stream plus neural reconstruction data that helps recover a visually accurate full-resolution video.
+
+This repo is an alpha implementation. It already creates and reads native `.nvc` files, includes a Zig CLI, includes a browser demo, and lays down the format/spec structure for the neural codec work. New here? Start with [HOW_TO_SETUP_FROM_SCRATCH.md](HOW_TO_SETUP_FROM_SCRATCH.md).
+
+The current alpha base codec is `BAS6`: a libvpx-vp9 IVF bitstream embedded inside the `BASE` chunk, encoded in CRF mode at the profile's downscaled resolution and frame rate. Earlier alpha base codecs (`BAS0`–`BAS5`) remain readable for backwards compatibility.
+>>>>>>> 4fa184d (Replace BAS5 with BAS6 VP9 base codec, add Real-ESRGAN and RIFE enhancers, per-clip distillation)
 
 ## What Is NVC?
 
@@ -46,17 +65,18 @@ Current alpha status:
 
 - Native `.nvc` chunked file container: working.
 - Per-chunk CRC checks: working.
-- `nvc encode`: working for a custom `BAS5` packetized Huffman-coded motion-compensated tiled transform base stream.
-- `nvc decode`: working for alpha preview video output.
+- `nvc encode`: working for `BAS6`, a libvpx-vp9 IVF bitstream stored inside the `BASE` chunk. Older `BAS0`–`BAS5` files remain readable.
+- `nvc decode`: working for full reconstruction at source resolution.
+- `nvc decode --enhancer realesrgan`: working when `realesrgan-ncnn-vulkan` is on `PATH`. Decoded base frames are upscaled with the bundled `realesr-animevideov3` model (Apple Silicon Vulkan/Metal supported via MoltenVK), then muxed with `libx264 -preset slow -crf 23` by default. Use `--crf 18` when you want a larger, higher-quality MP4.
 - `nvc info`: working.
 - `nvc inspect`: working.
-- Browser NVC Studio app: working for normal video upload to downloadable `.nvc`, `.nvc` upload to downloadable MP4, local `.nvc` playback, metadata, chunk info, drag-and-drop, range-loaded sample playback, compact sampled `PVW2` data inside `PRVW` for instant preview playback with play/pause/seek, BAS5 packet-index loading, GOP packet range fetches, packet byte cache, decoded GOP frame cache for Codec/Neural seek, alpha Codec playback across GOP packet boundaries, codec-base detail guidance, `FET1` feature residuals, `COL1`/`GRN1` reconstruction tuning in Neural mode, legacy color first-frame `BAS0`/`BAS1`/`BAS2`/`BAS3`/`BAS4` preview, and `MOD0` TinySR neural reconstruction through WebGPU with CPU fallback.
+- Browser NVC Studio app: working for normal video upload to downloadable `.nvc`, `.nvc` upload to downloadable MP4, local `.nvc` playback, metadata, chunk info, drag-and-drop, and range-loaded sample playback. Newer files use a single VP9 IVF base, decoded in the browser via WebCodecs `VideoDecoder`. Older `BAS0`–`BAS5` files still play through the existing custom decode path. `MOD0` TinySR neural reconstruction runs through WebGPU with a CPU fallback.
 - `NVC-TinySR-v0` model export: working as a self-contained `MOD0` artifact.
 - Optional PyTorch training path: working from normal source videos or paired `.pt` tensors.
 - Feature residuals: working as compact alpha `FET1` luma correction vectors inside `FEAT`.
 - `nvc bench`: working for encode/decode timing, `.nvc` size, approximate bitrate, encode FPS, and decode FPS. Perceptual metrics are still planned.
 
-The alpha encoder uses FFmpeg to read normal video files and extract raw frames. It does not put MP4, AV1, H.264, H.265, or VP9 video streams inside `.nvc`.
+The alpha encoder uses FFmpeg to read normal video files and extract raw frames, then shells out to libvpx-vp9 (also via FFmpeg) to compress the downscaled base stream. The resulting VP9 bitstream lives inside the `.nvc` container; NVC does not embed MP4, AV1, H.264, or H.265.
 
 ## Install Requirements
 
@@ -124,6 +144,17 @@ Decode it back to a normal video:
 ./zig-out/bin/nvc decode samples/output.nvc samples/reconstructed.mp4
 ```
 
+Optional: upscale decoded base frames with `realesrgan-ncnn-vulkan` before muxing the MP4. Install the binary first (download the macOS release zip from `https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases` and place it on your `PATH`, with the `models/` directory reachable via a wrapper that injects `-m`).
+
+```bash
+./zig-out/bin/nvc decode samples/output.nvc samples/reconstructed.mp4 \
+  --enhancer realesrgan \
+  --realesrgan-model realesr-animevideov3 \
+  --crf 18
+```
+
+The enhancer picks `-s 2`, `-s 3`, or `-s 4` automatically based on the base-to-source ratio; any remaining factor is filled in with a final lanczos scale before muxing.
+
 Run NVC Studio:
 
 ```bash
@@ -178,7 +209,7 @@ Use this for realtime web playback.
 ./zig-out/bin/nvc encode input.mp4 output.nvc --profile w1
 ```
 
-The alpha W1 encoder uses a half-resolution base stream and caps the coded stream at 30 fps. A 1920x1080 video becomes a 960x540 base stream.
+The alpha W1 encoder downscales to a half-resolution base stream, caps the coded stream at 30 fps, and encodes the base with libvpx-vp9 at CRF 36. A 1920x1080 video becomes a 960x540 VP9 base stream.
 
 ### NVC-XC
 
@@ -188,7 +219,7 @@ Use this for smaller files when slower encoding is okay.
 ./zig-out/bin/nvc encode input.mp4 output.nvc --profile xc
 ```
 
-The alpha XC encoder uses a one-sixth-resolution base stream, caps the coded stream at 12 fps, uses heavier quantization, and stores only a tiny sampled preview. A 1920x1080 video becomes a 320x180 base stream. This is much smaller than W1, but it is more lossy and depends more on neural reconstruction.
+The alpha XC encoder downscales to a one-quarter-resolution base stream, caps the coded stream at 12 fps, encodes the base with libvpx-vp9 at CRF 44, and stores only a tiny sampled preview. A 1920x1080 video becomes a 480x270 VP9 base stream. This is much smaller than W1, but it is more lossy and depends more on neural reconstruction.
 
 ## Project Structure
 
@@ -205,7 +236,7 @@ samples/ sample files and fixtures
 The final NVC playback pipeline is:
 
 1. Parse the `.nvc` file.
-2. Read the low-resolution `BASE` stream.
+2. Decode the low-resolution VP9 `BASE` stream (browser via WebCodecs `VideoDecoder`, CLI via libvpx-vp9 through FFmpeg).
 3. Load the bundled neural model from `MODL`.
 4. Apply motion/context data from `MOTN`.
 5. Apply feature residuals from `FEAT`.
@@ -213,7 +244,7 @@ The final NVC playback pipeline is:
 7. Add synthetic grain using `GRAN`.
 8. Draw the final frame to a canvas.
 
-NVC Studio adds browser upload/download workflows on top of the player. The Bun server accepts video uploads at `/api/encode`, calls the Zig CLI, and returns a `.nvc` download. It accepts `.nvc` uploads at `/api/decode`, calls the Zig decoder, and returns a decoded MP4 download. The playback surface parses `.nvc` files in the browser and uses compact sampled `PVW2` data inside `PRVW` for instant preview playback with play, pause, and seek controls. `PVW2` keeps the real source duration but stores roughly one tiny RGB preview frame per second, capped by profile, so the preview track does not dominate XC files. URL playback uses HTTP Range requests to load the header, `TOC0`, `PRVW`, `MODL`, `SEEK`, `FEAT`, `COLR`, `GRAN`, and the small BAS5 packet index first instead of downloading the whole file before the first frame. Codec and Neural modes then range-load only the BAS5 GOP packet needed for the current seek position. Neural mode runs TinySR, guides luma/detail from the decoded codec base so it does not throw away BAS5 detail, then applies `FET1` luma feature residuals, `COL1` color tuning, and `GRN1` deterministic grain. It still supports direct color first-frame decode for older `BAS0`, `BAS1`, `BAS2`, `BAS3`, and `BAS4` files that do not have `PRVW`, plus older still-frame `PVW0` files and older full-rate alpha `PVW1` preview-video files. It can run the embedded `MOD0` TinySR model through WebGPU, with a smaller CPU fallback if WebGPU is unavailable or too slow.
+NVC Studio adds browser upload/download workflows on top of the player. The Bun server accepts video uploads at `/api/encode`, calls the Zig CLI, and returns a `.nvc` download. It accepts `.nvc` uploads at `/api/decode`, calls the Zig decoder, and returns a decoded MP4 download. The playback surface parses `.nvc` files in the browser and uses compact sampled `PVW2` data inside `PRVW` for instant preview playback with play, pause, and seek controls. `PVW2` keeps the real source duration but stores roughly one tiny RGB preview frame per second, capped by profile, so the preview track does not dominate XC files. For new `BAS6` files the browser eagerly demuxes the embedded VP9 IVF and decodes every frame through WebCodecs `VideoDecoder` into an ImageData cache once the file loads, so Preview, Codec, and Neural modes can seek synchronously from there. Older `BAS0`–`BAS5` files keep the existing custom decode path with `PVW2` previews, BAS5 GOP packet range fetches, and packet byte caching. Neural mode runs TinySR, guides luma/detail from the decoded codec base so it does not throw away VP9 detail, then applies `FET1` luma feature residuals, `COL1` color tuning, and `GRN1` deterministic grain. It can run the embedded `MOD0` TinySR model through WebGPU, with a smaller CPU fallback if WebGPU is unavailable or too slow.
 
 ## How Compression Works
 
@@ -221,14 +252,16 @@ The intended NVC compression pipeline is:
 
 1. Decode the source video.
 2. Convert frames to YUV.
-3. Downscale frames.
+3. Downscale frames to the profile's base resolution and frame rate.
 4. Remove or simplify grain.
-5. Encode a custom low-resolution base stream with block prediction, previous-frame motion modes, RLE-compressed mode data, 4x4 transform blocks, quantization, zigzag scanning, zero-run coding, and signed varints.
+5. Encode the low-resolution base stream with libvpx-vp9 in CRF mode (`BAS6`).
 6. Store neural latents and feature residuals.
 7. Bundle neural model weights.
 8. Save everything into one `.nvc` file.
 
 The alpha implementation currently does steps 1, 2, 3, 5, 6, 7, and 8, plus source/base-stat `COL1` color tuning and basic `GRN1` grain synthesis. `FEAT` currently stores `FET1`, a compact per-frame tile luma correction stream. Step 4 is still basic.
+
+The earlier alpha base codecs (`BAS0`–`BAS5`) implemented progressively richer custom transform-and-entropy stacks (RLE, 4x4 Hadamard, predictive, motion-compensated, Huffman, then packetized GOPs). They are still readable, but a benchmark across five synthetic content types showed plain libvpx-vp9 produced 3–13x smaller `BASE` chunks at comparable or better VMAF than `BAS5`, so new encodes always write `BAS6`. The custom-codec work remains useful as a reference and as a fallback if a future profile needs container-only decoding without libvpx.
 
 ## Training A Model
 
@@ -327,23 +360,29 @@ Future NVC files will include a model architecture version. The player must supp
 
 ## Roadmap
 
+Done in alpha:
+
 1. Alpha container and CLI.
-2. Custom `BAS1` transform base codec.
+2. Custom `BAS1`–`BAS5` transform/entropy/motion base codecs (kept readable for old files).
 3. Browser parser and player.
-4. Custom `BAS2` predictive transform base codec.
-5. Custom `BAS3` motion-compensated transform base codec.
-6. Custom `BAS4` Huffman entropy-coded motion transform base codec.
-7. `NVC-TinySR-v0` training and `MOD0` export.
-8. `PRVW` instant browser preview stream with play/pause/seek.
-9. WebGPU neural model path.
-10. HTTP Range loading for URL preview playback.
-11. `BAS5` packetized `BASE` GOP format.
-12. Codec/Neural seek by BAS5 GOP range request.
-13. Continuous Neural playback optimization from BAS5 packets.
-14. Alpha `COL1` color restoration and `GRN1` grain synthesis.
-15. Alpha `FET1` feature residual stream.
-16. `NVC-XC` extreme compression mode.
-17. Audio support later.
+4. `NVC-TinySR-v0` training and `MOD0` export.
+5. `PRVW` instant browser preview stream with play/pause/seek.
+6. WebGPU neural model path.
+7. HTTP Range loading for URL preview playback.
+8. Alpha `COL1` color restoration and `GRN1` grain synthesis.
+9. Alpha `FET1` feature residual stream.
+10. `NVC-XC` extreme compression mode.
+11. `BAS6` libvpx-vp9 base codec via FFmpeg subprocess (current default).
+12. Browser WebCodecs `VideoDecoder` path for `BAS6`.
+13. `nvc decode --enhancer realesrgan` post-decode upscale.
+14. Better configurable `libx264` CRF MP4 mux on `nvc decode`.
+
+Planned:
+
+15. Continuous Neural playback optimization from VP9 base frames.
+16. Tighter VP9 rate control per profile (target-bitrate mode in addition to CRF).
+17. Replace `realesr-animevideov3` with a smaller WebGPU ONNX model for in-browser SR.
+18. Audio support.
 
 ## FAQ
 

@@ -12,6 +12,7 @@ const base3_header_len = 64;
 const base4_header_len = 68;
 const base5_header_len = 76;
 const base5_packet_entry_len = 24;
+const base6_header_len = 56;
 const feat1_header_len = 52;
 const transform_block_size = 4;
 const motion_mode_count = 6;
@@ -51,6 +52,7 @@ const BaseFormat = enum {
     motion_transform,
     entropy_motion_transform,
     packetized_entropy_motion_transform,
+    vp9_ivf,
 };
 
 const BaseInfo = struct {
@@ -70,6 +72,8 @@ const BaseInfo = struct {
     entropy: u32 = 0,
     gop_size: u32 = 0,
     packet_count: u32 = 0,
+    crf: u32 = 0,
+    target_bitrate_kbps: u32 = 0,
     coded: []const u8,
 };
 
@@ -164,15 +168,19 @@ fn printHelp() void {
         \\NVC alpha CLI
         \\
         \\Usage:
-        \\  nvc encode <input-video> <output.nvc> --profile w1|xc [--frames N|all] [--model PATH]
-        \\  nvc decode <input.nvc> <output.mp4>
+        \\  nvc encode <input-video> <output.nvc> --profile w1|xc [--frames N|all] [--model PATH] [--crf 0..63]
+        \\  nvc decode <input.nvc> <output.mp4> [--enhancer realesrgan|none] [--realesrgan-bin PATH]
+        \\                                       [--realesrgan-model NAME] [--realesrgan-scale 2|3|4] [--crf N]
+        \\                                       [--interpolate-rife] [--rife-bin PATH] [--target-fps N]
         \\  nvc info <input.nvc>
         \\  nvc inspect <input.nvc>
         \\  nvc bench <input-video> --profiles w1,xc [--frames N] [--model PATH] [--out-dir DIR]
         \\
         \\Alpha note:
-        \\  This build implements the native .nvc container and a custom tiled transform BASE stream.
+        \\  BASE chunks now contain a VP9 IVF bitstream (BAS6) produced via libvpx-vp9 in CRF mode.
         \\  Neural reconstruction chunks include MOD0 model data plus alpha FET1/COL1/GRN1 side data.
+        \\  decode --enhancer realesrgan upscales decoded base frames with realesrgan-ncnn-vulkan
+        \\  (defaults to model realesr-animevideov3 at -s 2/3/4 chosen from base->source ratio).
         \\
     , .{});
 }
@@ -188,6 +196,7 @@ fn cmdEncode(args: []const []const u8) !void {
     var profile: Profile = .w1;
     var frame_limit: u32 = 0;
     var model_path: ?[]const u8 = null;
+    var crf_override: ?u32 = null;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -202,6 +211,15 @@ fn cmdEncode(args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[i], "--model")) {
             if (i + 1 >= args.len) return error.InvalidArguments;
             model_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--crf")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            const v = try std.fmt.parseInt(u32, args[i + 1], 10);
+            if (v > 63) {
+                std.debug.print("--crf must be 0..63 (libvpx-vp9 range)\n", .{});
+                return error.InvalidArguments;
+            }
+            crf_override = v;
             i += 1;
         } else {
             std.debug.print("unknown encode option: {s}\n", .{args[i]});
@@ -232,8 +250,8 @@ fn cmdEncode(args: []const []const u8) !void {
 
     const frame_count: u32 = @intCast(raw.len / frame_size);
     const trimmed_raw = raw[0 .. @as(usize, frame_count) * frame_size];
-    const base_quant = chooseBaseQuant(profile);
-    const base_build = try buildBasePayload(trimmed_raw, base_dims.width, base_dims.height, codec_rate.fps_num, codec_rate.fps_den, frame_count, base_quant.y, base_quant.uv, chooseBaseGopSize(profile));
+    const vp9_crf = crf_override orelse chooseVp9Crf(profile);
+    const base_build = try buildVp9BasePayload(output, trimmed_raw, base_dims.width, base_dims.height, codec_rate.fps_num, codec_rate.fps_den, frame_count, vp9_crf);
     defer allocator.free(base_build.payload);
     const decoded_base = try decodeBasePayload(try parseBasePayload(base_build.payload));
     defer allocator.free(decoded_base);
@@ -252,10 +270,10 @@ fn cmdEncode(args: []const []const u8) !void {
     defer allocator.free(gran);
     const colr = try buildColorPayload(trimmed_raw, decoded_base, base_dims.width, base_dims.height, frame_count);
     defer allocator.free(colr);
-    const entr = "BASE uses BAS5 packetized GOP payloads; each GOP uses BAS4-style Huffman entropy over BAS3 motion-compensated data\n";
+    const entr = "BASE uses BAS6 VP9 IVF payloads encoded via libvpx-vp9 in CRF mode; downscaled YUV420p source at the profile's base resolution and codec frame rate\n";
     const seek = try buildSeekPayload(frame_count, base_build.gop_size, base_build.packet_count);
     defer allocator.free(seek);
-    const meta = try buildMetaPayload(input, output, raw.len, base_build.coded_size, base_quant.y, base_quant.uv, base_build.gop_size, base_build.packet_count);
+    const meta = try buildMetaPayload(input, output, raw.len, base_build.coded_size, vp9_crf, base_build.gop_size, base_build.packet_count);
     defer allocator.free(meta);
     const audi = "reserved for future audio support\n";
 
@@ -275,7 +293,7 @@ fn cmdEncode(args: []const []const u8) !void {
 
     try writeNvc(output, head, &chunks);
     std.debug.print("encoded {s} -> {s}\n", .{ input, output });
-    std.debug.print("profile={s} source={d}x{d}@{d}/{d} base={d}x{d}@{d}/{d} frames={d} raw_base={d} coded_base={d} qY={d} qUV={d}\n", .{
+    std.debug.print("profile={s} source={d}x{d}@{d}/{d} base={d}x{d}@{d}/{d} frames={d} raw_base={d} coded_base={d} base_codec=BAS6-vp9 crf={d}\n", .{
         profile.label(),
         probe.width,
         probe.height,
@@ -288,19 +306,90 @@ fn cmdEncode(args: []const []const u8) !void {
         frame_count,
         trimmed_raw.len,
         base_build.coded_size,
-        base_quant.y,
-        base_quant.uv,
+        vp9_crf,
     });
 }
 
+const Enhancer = enum { none, realesrgan };
+
 fn cmdDecode(args: []const []const u8) !void {
     if (args.len < 2) {
-        std.debug.print("decode needs <input.nvc> <output.mp4>\n", .{});
+        std.debug.print("decode needs <input.nvc> <output.mp4> [--enhancer realesrgan] [--realesrgan-bin PATH] [--realesrgan-model NAME] [--crf N]\n", .{});
         return error.InvalidArguments;
     }
 
     const input = args[0];
     const output = args[1];
+    var enhancer: Enhancer = .none;
+    var realesrgan_bin: []const u8 = "realesrgan-ncnn-vulkan";
+    // "auto" picks the right model+scale from the base->source ratio. FourPeople
+    // benchmark showed asymmetric winners: animevideov3 +2.7 VMAF on W1 (2x ratio)
+    // because of its native x2 weights; upscayl-standard-4x +9 VMAF on XC (6x ratio)
+    // because there both models must run `-s 4` + lanczos-up, where the stronger
+    // priors of x4plus win. Override either field explicitly to opt out of auto.
+    var realesrgan_model: []const u8 = "auto";
+    var realesrgan_scale: u32 = 0; // 0 = auto from base->source ratio
+    // libx264 CRF default. 23 matches libx264's own default and produces MP4s of comparable
+    // size to typical consumer source files. Use --crf 18 for archival quality, --crf 28+
+    // for smaller MP4s than the source.
+    var crf: u32 = 23;
+    // RIFE frame interpolation. Most useful for XC (12 fps base -> 30 fps output), but
+    // can be applied to any decode. Target fps defaults to the source fps from HEAD.
+    var interpolate_rife: bool = false;
+    var rife_bin: []const u8 = "rife-ncnn-vulkan";
+    var target_fps_num: u32 = 0; // 0 = read from HEAD source_fps_num
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--enhancer")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            const v = args[i + 1];
+            if (std.mem.eql(u8, v, "realesrgan")) {
+                enhancer = .realesrgan;
+            } else if (std.mem.eql(u8, v, "none")) {
+                enhancer = .none;
+            } else {
+                std.debug.print("unknown enhancer: {s}\n", .{v});
+                return error.InvalidArguments;
+            }
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--realesrgan-bin")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            realesrgan_bin = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--realesrgan-model")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            realesrgan_model = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--realesrgan-scale")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            const v = try std.fmt.parseInt(u32, args[i + 1], 10);
+            if (v != 0 and (v < 2 or v > 4)) {
+                std.debug.print("--realesrgan-scale must be 0 (auto), 2, 3, or 4\n", .{});
+                return error.InvalidArguments;
+            }
+            realesrgan_scale = v;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--crf")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            crf = try std.fmt.parseInt(u32, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--interpolate-rife")) {
+            interpolate_rife = true;
+        } else if (std.mem.eql(u8, args[i], "--rife-bin")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            rife_bin = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--target-fps")) {
+            if (i + 1 >= args.len) return error.InvalidArguments;
+            target_fps_num = try std.fmt.parseInt(u32, args[i + 1], 10);
+            i += 1;
+        } else {
+            std.debug.print("unknown decode option: {s}\n", .{args[i]});
+            return error.InvalidArguments;
+        }
+    }
+
     const parsed = try readNvc(input);
     defer parsed.deinit();
 
@@ -322,8 +411,29 @@ fn cmdDecode(args: []const []const u8) !void {
     const head = parsed.find("HEAD") orelse return error.MissingHeadChunk;
     const out_width = parseHeadU32(head.payload, "width") orelse base.width;
     const out_height = parseHeadU32(head.payload, "height") orelse base.height;
-    try writeOutputVideo(temp_raw, output, base.width, base.height, out_width, out_height, base.fps_num, base.fps_den);
-    std.debug.print("decoded {s} -> {s}\n", .{ input, output });
+    // Target fps for RIFE: defaults to HEAD source_fps_num (the original capture rate)
+    // so XC's 12 fps coded base interpolates back up to typically 30 fps.
+    const source_fps_num = parseHeadU32(head.payload, "source_fps_num") orelse base.fps_num;
+    const source_fps_den = parseHeadU32(head.payload, "source_fps_den") orelse base.fps_den;
+    const effective_target_fps_num: u32 = if (target_fps_num > 0) target_fps_num else source_fps_num;
+    const target_frame_count: u32 = if (interpolate_rife and base.fps_num > 0)
+        @intCast((@as(u64, base.frame_count) * effective_target_fps_num * base.fps_den) / (@as(u64, base.fps_num) * source_fps_den))
+    else
+        base.frame_count;
+
+    if (interpolate_rife or enhancer == .realesrgan) {
+        try writeOutputVideoEnhanced(temp_raw, output, base.width, base.height, out_width, out_height, base.fps_num, base.fps_den, enhancer, realesrgan_bin, realesrgan_model, realesrgan_scale, interpolate_rife, rife_bin, effective_target_fps_num, source_fps_den, target_frame_count, crf);
+    } else {
+        try writeOutputVideo(temp_raw, output, base.width, base.height, out_width, out_height, base.fps_num, base.fps_den, crf);
+    }
+
+    if (interpolate_rife) {
+        std.debug.print("decoded {s} -> {s} (enhancer={s} rife={d}->{d} target_frames={d} crf={d})\n", .{ input, output, if (enhancer == .realesrgan) "realesrgan" else "none", base.fps_num, effective_target_fps_num, target_frame_count, crf });
+    } else if (enhancer == .realesrgan) {
+        std.debug.print("decoded {s} -> {s} (enhancer=realesrgan model={s} crf={d})\n", .{ input, output, realesrgan_model, crf });
+    } else {
+        std.debug.print("decoded {s} -> {s} (crf={d})\n", .{ input, output, crf });
+    }
 }
 
 fn cmdInfo(args: []const []const u8, inspect: bool) !void {
@@ -364,6 +474,16 @@ fn cmdInfo(args: []const []const u8, inspect: bool) !void {
             if (base.format == .packetized_entropy_motion_transform) {
                 std.debug.print("base_gop_size={d}\nbase_packet_count={d}\n", .{ base.gop_size, base.packet_count });
             }
+        }
+        if (base.format == .vp9_ivf) {
+            std.debug.print("base_vp9_crf={d}\nbase_dimensions={d}x{d}@{d}/{d}\nbase_frames={d}\n", .{
+                base.crf,
+                base.width,
+                base.height,
+                base.fps_num,
+                base.fps_den,
+                base.frame_count,
+            });
         }
     }
     if (parsed.find("MODL")) |modl_chunk| {
@@ -540,6 +660,7 @@ fn baseCodecLabel(format: BaseFormat) []const u8 {
         .motion_transform => "BAS3-motion-tiled-hadamard-zero-run-varint",
         .entropy_motion_transform => "BAS4-huffman-coded-motion-transform",
         .packetized_entropy_motion_transform => "BAS5-packetized-huffman-motion-transform",
+        .vp9_ivf => "BAS6-vp9-ivf-via-libvpx",
     };
 }
 
@@ -693,7 +814,9 @@ fn parseRate(text: []const u8, probe: *VideoProbe) void {
 fn chooseBaseDimensions(profile: Profile, width: u32, height: u32) struct { width: u32, height: u32 } {
     const divisor: u32 = switch (profile) {
         .w1 => 2,
-        .xc => 6,
+        // XC uses 1/4 resolution so the base->source ratio matches the upscayl-standard-4x
+        // model's native 4x scale (no lanczos round-trip on the SR step).
+        .xc => 4,
     };
     return .{ .width = evenAtLeast2(width / divisor), .height = evenAtLeast2(height / divisor) };
 }
@@ -758,13 +881,15 @@ fn extractBaseRaw(input: []const u8, temp_raw: []const u8, width: u32, height: u
     allocator.free(out);
 }
 
-fn writeOutputVideo(temp_raw: []const u8, output: []const u8, base_width: u32, base_height: u32, out_width: u32, out_height: u32, fps_num: u32, fps_den: u32) !void {
+fn writeOutputVideo(temp_raw: []const u8, output: []const u8, base_width: u32, base_height: u32, out_width: u32, out_height: u32, fps_num: u32, fps_den: u32, crf: u32) !void {
     const size = try std.fmt.allocPrint(allocator, "{d}x{d}", .{ base_width, base_height });
     defer allocator.free(size);
     const rate = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ fps_num, fps_den });
     defer allocator.free(rate);
     const scale = try std.fmt.allocPrint(allocator, "scale={d}:{d}:flags=lanczos", .{ out_width, out_height });
     defer allocator.free(scale);
+    const crf_arg = try std.fmt.allocPrint(allocator, "{d}", .{crf});
+    defer allocator.free(crf_arg);
 
     const argv = [_][]const u8{
         "ffmpeg",
@@ -784,12 +909,219 @@ fn writeOutputVideo(temp_raw: []const u8, output: []const u8, base_width: u32, b
         temp_raw,
         "-vf",
         scale,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "slow",
+        "-crf",
+        crf_arg,
         "-pix_fmt",
         "yuv420p",
         output,
     };
     const out = try runChecked(&argv, 1024 * 1024);
     allocator.free(out);
+}
+
+fn writeOutputVideoRealesrgan(temp_raw: []const u8, output: []const u8, base_width: u32, base_height: u32, out_width: u32, out_height: u32, fps_num: u32, fps_den: u32, frame_count: u32, bin_path: []const u8, requested_model: []const u8, requested_scale: u32, crf: u32) !void {
+    const stamp = std.time.nanoTimestamp();
+    const dir_in = try std.fmt.allocPrint(allocator, "/tmp/nvc-rerun-{d}.in", .{stamp});
+    defer allocator.free(dir_in);
+    const dir_out = try std.fmt.allocPrint(allocator, "/tmp/nvc-rerun-{d}.out", .{stamp});
+    defer allocator.free(dir_out);
+    defer cleanupTempDir(dir_in);
+    defer cleanupTempDir(dir_out);
+
+    try std.fs.cwd().makePath(dir_in);
+    try std.fs.cwd().makePath(dir_out);
+
+    // Resolve auto model/scale from the base->source ratio.
+    // - ratio <= 3 → realesr-animevideov3 with native x2/x3 weights (FourPeople W1: +2.7 VMAF)
+    // - ratio >= 4 → upscayl-standard-4x at -s 4 (FourPeople XC: +9 VMAF)
+    const auto = std.mem.eql(u8, requested_model, "auto");
+    const ratio = if (base_width > 0) (out_width + base_width / 2) / base_width else 1;
+    const sr_scale: u32 = if (requested_scale != 0) requested_scale else if (ratio <= 2) 2 else if (ratio == 3) 3 else 4;
+    const model_name: []const u8 = if (!auto) requested_model else if (sr_scale <= 3) "realesr-animevideov3" else "upscayl-standard-4x";
+
+    const size = try std.fmt.allocPrint(allocator, "{d}x{d}", .{ base_width, base_height });
+    defer allocator.free(size);
+    const rate = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ fps_num, fps_den });
+    defer allocator.free(rate);
+    const png_pattern = try std.fmt.allocPrint(allocator, "{s}/frame_%05d.png", .{dir_in});
+    defer allocator.free(png_pattern);
+
+    {
+        const argv = [_][]const u8{
+            "ffmpeg",        "-hide_banner",        "-loglevel",   "error",
+            "-y",            "-f",                  "rawvideo",    "-pix_fmt",
+            "yuv420p",       "-s",                  size,          "-r",
+            rate,            "-i",                  temp_raw,      "-vsync",
+            "passthrough",   "-pix_fmt",            "rgb24",       png_pattern,
+        };
+        const out = try runChecked(&argv, 1024 * 1024);
+        allocator.free(out);
+    }
+
+    const sr_arg = try std.fmt.allocPrint(allocator, "{d}", .{sr_scale});
+    defer allocator.free(sr_arg);
+
+    {
+        const argv = [_][]const u8{
+            bin_path, "-i", dir_in, "-o", dir_out, "-n", model_name, "-s", sr_arg, "-f", "png",
+        };
+        const out = runChecked(&argv, 8 * 1024 * 1024) catch |err| {
+            std.debug.print("realesrgan-ncnn-vulkan failed (binary={s}). Install via the macOS release zip and ensure it is on PATH (and that 'models/' is reachable, e.g. via a wrapper that supplies -m).\n", .{bin_path});
+            return err;
+        };
+        allocator.free(out);
+    }
+
+    const upscaled_pattern = try std.fmt.allocPrint(allocator, "{s}/frame_%05d.png", .{dir_out});
+    defer allocator.free(upscaled_pattern);
+    const final_scale = try std.fmt.allocPrint(allocator, "scale={d}:{d}:flags=lanczos", .{ out_width, out_height });
+    defer allocator.free(final_scale);
+    const fps_arg = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ fps_num, fps_den });
+    defer allocator.free(fps_arg);
+    const crf_arg = try std.fmt.allocPrint(allocator, "{d}", .{crf});
+    defer allocator.free(crf_arg);
+    const frames_arg = try std.fmt.allocPrint(allocator, "{d}", .{frame_count});
+    defer allocator.free(frames_arg);
+
+    {
+        const argv = [_][]const u8{
+            "ffmpeg",     "-hide_banner",   "-loglevel",      "error",          "-y",
+            "-framerate", fps_arg,          "-i",             upscaled_pattern,
+            "-frames:v",  frames_arg,
+            "-vf",        final_scale,      "-c:v",           "libx264",
+            "-preset",    "slow",           "-crf",           crf_arg,
+            "-pix_fmt",   "yuv420p",        output,
+        };
+        const out = try runChecked(&argv, 1024 * 1024);
+        allocator.free(out);
+    }
+}
+
+fn cleanupTempDir(path: []const u8) void {
+    std.fs.cwd().deleteTree(path) catch {};
+}
+
+fn writeOutputVideoEnhanced(
+    temp_raw: []const u8,
+    output: []const u8,
+    base_width: u32,
+    base_height: u32,
+    out_width: u32,
+    out_height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    enhancer: Enhancer,
+    realesrgan_bin: []const u8,
+    requested_model: []const u8,
+    requested_scale: u32,
+    interpolate_rife: bool,
+    rife_bin: []const u8,
+    target_fps_num: u32,
+    target_fps_den: u32,
+    target_frame_count: u32,
+    crf: u32,
+) !void {
+    const stamp = std.time.nanoTimestamp();
+    const dir_yuv = try std.fmt.allocPrint(allocator, "/tmp/nvc-pipe-{d}.yuv-pngs", .{stamp});
+    defer allocator.free(dir_yuv);
+    const dir_sr = try std.fmt.allocPrint(allocator, "/tmp/nvc-pipe-{d}.sr-pngs", .{stamp});
+    defer allocator.free(dir_sr);
+    const dir_rife = try std.fmt.allocPrint(allocator, "/tmp/nvc-pipe-{d}.rife-pngs", .{stamp});
+    defer allocator.free(dir_rife);
+    defer cleanupTempDir(dir_yuv);
+    defer cleanupTempDir(dir_sr);
+    defer cleanupTempDir(dir_rife);
+
+    try std.fs.cwd().makePath(dir_yuv);
+
+    // Stage 1: YUV -> PNG sequence at base resolution + base fps.
+    {
+        const size_arg = try std.fmt.allocPrint(allocator, "{d}x{d}", .{ base_width, base_height });
+        defer allocator.free(size_arg);
+        const rate_arg = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ fps_num, fps_den });
+        defer allocator.free(rate_arg);
+        const png_pattern = try std.fmt.allocPrint(allocator, "{s}/frame_%05d.png", .{dir_yuv});
+        defer allocator.free(png_pattern);
+        const argv = [_][]const u8{
+            "ffmpeg",       "-hide_banner", "-loglevel", "error",
+            "-y",           "-f",           "rawvideo",  "-pix_fmt",
+            "yuv420p",      "-s",           size_arg,    "-r",
+            rate_arg,       "-i",           temp_raw,    "-vsync",
+            "passthrough",  "-pix_fmt",     "rgb24",     png_pattern,
+        };
+        const out = try runChecked(&argv, 1024 * 1024);
+        allocator.free(out);
+    }
+
+    // Stage 2 (optional): Real-ESRGAN super-resolution.
+    var current_dir: []const u8 = dir_yuv;
+    if (enhancer == .realesrgan) {
+        try std.fs.cwd().makePath(dir_sr);
+        const auto = std.mem.eql(u8, requested_model, "auto");
+        const ratio = if (base_width > 0) (out_width + base_width / 2) / base_width else 1;
+        const sr_scale: u32 = if (requested_scale != 0) requested_scale else if (ratio <= 2) 2 else if (ratio == 3) 3 else 4;
+        const model_name: []const u8 = if (!auto) requested_model else if (sr_scale <= 3) "realesr-animevideov3" else "upscayl-standard-4x";
+        const sr_arg = try std.fmt.allocPrint(allocator, "{d}", .{sr_scale});
+        defer allocator.free(sr_arg);
+        const argv = [_][]const u8{
+            realesrgan_bin, "-i", current_dir, "-o", dir_sr, "-n", model_name, "-s", sr_arg, "-f", "png",
+        };
+        const out = runChecked(&argv, 8 * 1024 * 1024) catch |err| {
+            std.debug.print("realesrgan-ncnn-vulkan failed (binary={s}). Install via the macOS release zip and ensure it is on PATH.\n", .{realesrgan_bin});
+            return err;
+        };
+        allocator.free(out);
+        current_dir = dir_sr;
+    }
+
+    // Stage 3 (optional): RIFE temporal interpolation.
+    if (interpolate_rife) {
+        try std.fs.cwd().makePath(dir_rife);
+        const target_arg = try std.fmt.allocPrint(allocator, "{d}", .{target_frame_count});
+        defer allocator.free(target_arg);
+        const argv = [_][]const u8{
+            rife_bin, "-i", current_dir, "-o", dir_rife, "-n", target_arg,
+        };
+        const out = runChecked(&argv, 8 * 1024 * 1024) catch |err| {
+            std.debug.print("rife-ncnn-vulkan failed (binary={s}). Install from https://github.com/nihui/rife-ncnn-vulkan/releases and ensure it is on PATH (with -m models reachable via a wrapper).\n", .{rife_bin});
+            return err;
+        };
+        allocator.free(out);
+        current_dir = dir_rife;
+    }
+
+    // Stage 4: PNG sequence -> MP4 (libx264 -preset slow -crf N) at target fps.
+    {
+        const png_pattern = try std.fmt.allocPrint(allocator, "{s}/frame_%05d.png", .{current_dir});
+        defer allocator.free(png_pattern);
+        // RIFE writes %08d.png by convention; YUV stage and Real-ESRGAN preserve %05d.
+        const png_pattern_rife = try std.fmt.allocPrint(allocator, "{s}/%08d.png", .{current_dir});
+        defer allocator.free(png_pattern_rife);
+        const fps_arg = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ target_fps_num, target_fps_den });
+        defer allocator.free(fps_arg);
+        const final_scale = try std.fmt.allocPrint(allocator, "scale={d}:{d}:flags=lanczos", .{ out_width, out_height });
+        defer allocator.free(final_scale);
+        const crf_arg = try std.fmt.allocPrint(allocator, "{d}", .{crf});
+        defer allocator.free(crf_arg);
+        const frames_arg = try std.fmt.allocPrint(allocator, "{d}", .{target_frame_count});
+        defer allocator.free(frames_arg);
+
+        const input_pattern = if (interpolate_rife) png_pattern_rife else png_pattern;
+        const argv = [_][]const u8{
+            "ffmpeg",     "-hide_banner",   "-loglevel",      "error",          "-y",
+            "-framerate", fps_arg,          "-i",             input_pattern,
+            "-frames:v",  frames_arg,
+            "-vf",        final_scale,      "-c:v",           "libx264",
+            "-preset",    "slow",           "-crf",           crf_arg,
+            "-pix_fmt",   "yuv420p",        output,
+        };
+        const out = try runChecked(&argv, 1024 * 1024);
+        allocator.free(out);
+    }
 }
 
 fn runChecked(argv: []const []const u8, max_output: usize) ![]u8 {
@@ -837,21 +1169,20 @@ fn buildHeadPayload(profile: Profile, probe: VideoProbe, base_width: u32, base_h
     , .{ profile.label(), probe.width, probe.height, codec_fps_num, codec_fps_den, probe.duration_ms, base_width, base_height, probe.fps_num, probe.fps_den, frame_count });
 }
 
-fn buildMetaPayload(input: []const u8, output: []const u8, raw_len: usize, coded_len: usize, y_quant: u32, uv_quant: u32, gop_size: u32, packet_count: u32) ![]u8 {
+fn buildMetaPayload(input: []const u8, output: []const u8, raw_len: usize, coded_len: usize, vp9_crf: u32, gop_size: u32, packet_count: u32) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\created_by=nvc-alpha-zig
         \\input={s}
         \\output={s}
         \\base_raw_bytes={d}
         \\base_coded_bytes={d}
-        \\base_codec=BAS5-packetized-huffman-motion-transform
-        \\base_y_quant={d}
-        \\base_uv_quant={d}
+        \\base_codec=BAS6-vp9-ivf-via-libvpx
+        \\base_vp9_crf={d}
         \\base_gop_size={d}
         \\base_packet_count={d}
-        \\note=Neural chunks are alpha MOD0 plus FET1/COL1/GRN1 reconstruction side data.
+        \\note=Neural chunks are alpha MOD0 plus FET1/COL1/GRN1 reconstruction side data over a VP9 IVF base.
         \\
-    , .{ input, output, raw_len, coded_len, y_quant, uv_quant, gop_size, packet_count });
+    , .{ input, output, raw_len, coded_len, vp9_crf, gop_size, packet_count });
 }
 
 fn buildSeekPayload(frame_count: u32, gop_size: u32, packet_count: u32) ![]u8 {
@@ -860,7 +1191,7 @@ fn buildSeekPayload(frame_count: u32, gop_size: u32, packet_count: u32) ![]u8 {
         \\gop_size={d}
         \\frames={d}
         \\packets={d}
-        \\note=BAS5 stores independently decodable GOP packets inside BASE. Packet byte offsets live in the BAS5 table.
+        \\note=BAS6 BASE chunks contain a VP9 IVF bitstream; seek using IVF frame indices.
         \\
     , .{ gop_size, frame_count, packet_count });
 }
@@ -1353,6 +1684,26 @@ fn parseBasePayload(payload: []const u8) !BaseInfo {
         };
     }
 
+    if (std.mem.eql(u8, payload[0..4], "BAS6")) {
+        if (payload.len < base6_header_len) return error.InvalidBasePayload;
+        const coded_size = readU64(payload[36..44]);
+        const coded_len = try castUsize(coded_size);
+        if (payload.len < base6_header_len + coded_len) return error.InvalidBasePayload;
+        return .{
+            .format = .vp9_ivf,
+            .width = readU32(payload[8..12]),
+            .height = readU32(payload[12..16]),
+            .fps_num = readU32(payload[16..20]),
+            .fps_den = readU32(payload[20..24]),
+            .frame_count = readU32(payload[24..28]),
+            .raw_size = readU64(payload[28..36]),
+            .coded_size = coded_size,
+            .crf = readU32(payload[44..48]),
+            .target_bitrate_kbps = readU32(payload[48..52]),
+            .coded = payload[base6_header_len .. base6_header_len + coded_len],
+        };
+    }
+
     return error.InvalidBasePayload;
 }
 
@@ -1564,7 +1915,149 @@ fn decodeBasePayload(base: BaseInfo) ![]u8 {
         .motion_transform => decodeBaseMotionTransform(base),
         .entropy_motion_transform => decodeBaseEntropyMotionTransform(base),
         .packetized_entropy_motion_transform => decodeBasePacketizedEntropyMotionTransform(base),
+        .vp9_ivf => decodeBaseVp9Ivf(base),
     };
+}
+
+fn chooseVp9Crf(profile: Profile) u32 {
+    return switch (profile) {
+        .w1 => 36,
+        .xc => 44,
+    };
+}
+
+fn buildVp9BasePayload(temp_prefix: []const u8, raw: []const u8, width: u32, height: u32, fps_num: u32, fps_den: u32, frame_count: u32, crf: u32) !BaseBuild {
+    const frame_size = yuv420FrameSize(width, height);
+    if (frame_size == 0 or raw.len < frame_size * @as(usize, frame_count)) return error.InvalidBasePayload;
+
+    const yuv_path = try std.fmt.allocPrint(allocator, "{s}.vp9enc.tmp.yuv", .{temp_prefix});
+    defer allocator.free(yuv_path);
+    defer std.fs.cwd().deleteFile(yuv_path) catch {};
+    const ivf_path = try std.fmt.allocPrint(allocator, "{s}.vp9enc.tmp.ivf", .{temp_prefix});
+    defer allocator.free(ivf_path);
+    defer std.fs.cwd().deleteFile(ivf_path) catch {};
+
+    {
+        var file = try std.fs.cwd().createFile(yuv_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(raw[0 .. @as(usize, frame_count) * frame_size]);
+    }
+
+    const size_arg = try std.fmt.allocPrint(allocator, "{d}x{d}", .{ width, height });
+    defer allocator.free(size_arg);
+    const rate_arg = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ fps_num, fps_den });
+    defer allocator.free(rate_arg);
+    const crf_arg = try std.fmt.allocPrint(allocator, "{d}", .{crf});
+    defer allocator.free(crf_arg);
+
+    const argv = [_][]const u8{
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-s",
+        size_arg,
+        "-r",
+        rate_arg,
+        "-i",
+        yuv_path,
+        "-c:v",
+        "libvpx-vp9",
+        "-crf",
+        crf_arg,
+        "-b:v",
+        "0",
+        "-row-mt",
+        "1",
+        "-tile-columns",
+        "2",
+        "-threads",
+        "8",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "ivf",
+        ivf_path,
+    };
+    const ffmpeg_stdout = try runChecked(&argv, 1024 * 1024);
+    allocator.free(ffmpeg_stdout);
+
+    const ivf = try std.fs.cwd().readFileAlloc(allocator, ivf_path, max_file_bytes);
+    defer allocator.free(ivf);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "BAS6");
+    try appendU16(&out, 6);
+    try appendU16(&out, 0);
+    try appendU32(&out, width);
+    try appendU32(&out, height);
+    try appendU32(&out, fps_num);
+    try appendU32(&out, fps_den);
+    try appendU32(&out, frame_count);
+    try appendU64(&out, @intCast(@as(usize, frame_count) * frame_size));
+    try appendU64(&out, @intCast(ivf.len));
+    try appendU32(&out, crf);
+    try appendU32(&out, 0); // target_bitrate_kbps unused in CRF mode
+    try appendU32(&out, 0); // reserved
+    try out.appendSlice(allocator, ivf);
+
+    return .{
+        .payload = try out.toOwnedSlice(allocator),
+        .coded_size = ivf.len,
+        .gop_size = 0,
+        .packet_count = 0,
+    };
+}
+
+fn decodeBaseVp9Ivf(base: BaseInfo) ![]u8 {
+    const stamp = std.time.nanoTimestamp();
+    const ivf_path = try std.fmt.allocPrint(allocator, "/tmp/nvc-vp9dec-{d}.ivf", .{stamp});
+    defer allocator.free(ivf_path);
+    defer std.fs.cwd().deleteFile(ivf_path) catch {};
+    const yuv_path = try std.fmt.allocPrint(allocator, "/tmp/nvc-vp9dec-{d}.yuv", .{stamp});
+    defer allocator.free(yuv_path);
+    defer std.fs.cwd().deleteFile(yuv_path) catch {};
+
+    {
+        var file = try std.fs.cwd().createFile(ivf_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(base.coded);
+    }
+
+    const size_arg = try std.fmt.allocPrint(allocator, "{d}x{d}", .{ base.width, base.height });
+    defer allocator.free(size_arg);
+
+    const argv = [_][]const u8{
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        ivf_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-s",
+        size_arg,
+        yuv_path,
+    };
+    const ffmpeg_stdout = try runChecked(&argv, 1024 * 1024);
+    allocator.free(ffmpeg_stdout);
+
+    const raw = try std.fs.cwd().readFileAlloc(allocator, yuv_path, max_file_bytes);
+    return raw;
 }
 
 fn decodeBaseTransform(base: BaseInfo) ![]u8 {
@@ -2567,8 +3060,8 @@ test "profile rate caps and XC base settings" {
     try std.testing.expectEqual(@as(u32, 1), xc_rate.fps_den);
 
     const dims = chooseBaseDimensions(.xc, 1920, 1080);
-    try std.testing.expectEqual(@as(u32, 320), dims.width);
-    try std.testing.expectEqual(@as(u32, 180), dims.height);
+    try std.testing.expectEqual(@as(u32, 480), dims.width);
+    try std.testing.expectEqual(@as(u32, 270), dims.height);
 }
 
 test "entropy coder roundtrip" {
