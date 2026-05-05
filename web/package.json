@@ -1,0 +1,11 @@
+{
+  "name": "nvc-web-player",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run server.ts",
+    "build": "bun build ./src/main.ts --outdir ./dist --target browser"
+  },
+  "devDependencies": {}
+}

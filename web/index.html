@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NVC Web Player</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="player">
+        <canvas id="preview" width="960" height="540"></canvas>
+        <div id="dropzone" class="dropzone">
+          <strong>Drop a .nvc file here</strong>
+          <button id="loadSample" type="button">Sample</button>
+        </div>
+      </section>
+      <aside class="panel">
+        <h1>NVC Player</h1>
+        <p id="webgpu">Checking WebGPU...</p>
+        <div class="segmented" aria-label="Render mode">
+          <button type="button" class="active" data-mode="preview">Preview</button>
+          <button type="button" data-mode="codec">Codec</button>
+          <button type="button" data-mode="neural">Neural</button>
+        </div>
+        <div class="transport">
+          <button id="playPause" type="button">Play</button>
+          <input id="seek" type="range" min="0" max="0" value="0" step="1" />
+          <span id="timecode">0:00 / 0:00</span>
+        </div>
+        <dl id="metadata"></dl>
+        <pre id="log">Waiting for a file.</pre>
+      </aside>
+    </main>
+    <script type="module" src="/bundle.js"></script>
+  </body>
+</html>
