@@ -39,6 +39,11 @@ const VideoProbe = struct {
     duration_ms: u64 = 0,
 };
 
+const CodecRate = struct {
+    fps_num: u32,
+    fps_den: u32,
+};
+
 const BaseFormat = enum {
     rle,
     transform,
@@ -210,11 +215,12 @@ fn cmdEncode(args: []const []const u8) !void {
     };
 
     const base_dims = chooseBaseDimensions(profile, probe.width, probe.height);
+    const codec_rate = chooseCodecRate(profile, probe.fps_num, probe.fps_den);
     const temp_raw = try std.fmt.allocPrint(allocator, "{s}.nvc-base.tmp.yuv", .{output});
     defer allocator.free(temp_raw);
     defer std.fs.cwd().deleteFile(temp_raw) catch {};
 
-    try extractBaseRaw(input, temp_raw, base_dims.width, base_dims.height, probe.fps_num, probe.fps_den, frame_limit);
+    try extractBaseRaw(input, temp_raw, base_dims.width, base_dims.height, codec_rate.fps_num, codec_rate.fps_den, frame_limit);
     const raw = try std.fs.cwd().readFileAlloc(allocator, temp_raw, max_file_bytes);
     defer allocator.free(raw);
 
@@ -227,15 +233,15 @@ fn cmdEncode(args: []const []const u8) !void {
     const frame_count: u32 = @intCast(raw.len / frame_size);
     const trimmed_raw = raw[0 .. @as(usize, frame_count) * frame_size];
     const base_quant = chooseBaseQuant(profile);
-    const base_build = try buildBasePayload(trimmed_raw, base_dims.width, base_dims.height, probe.fps_num, probe.fps_den, frame_count, base_quant.y, base_quant.uv, chooseBaseGopSize(profile));
+    const base_build = try buildBasePayload(trimmed_raw, base_dims.width, base_dims.height, codec_rate.fps_num, codec_rate.fps_den, frame_count, base_quant.y, base_quant.uv, chooseBaseGopSize(profile));
     defer allocator.free(base_build.payload);
     const decoded_base = try decodeBasePayload(try parseBasePayload(base_build.payload));
     defer allocator.free(decoded_base);
 
-    const head = try buildHeadPayload(profile, probe, base_dims.width, base_dims.height, frame_count);
+    const head = try buildHeadPayload(profile, probe, base_dims.width, base_dims.height, frame_count, codec_rate.fps_num, codec_rate.fps_den);
     defer allocator.free(head);
     const preview_settings = choosePreviewSettings(profile);
-    const prvw = try buildPreviewPayload(trimmed_raw, base_dims.width, base_dims.height, frame_count, probe.fps_num, probe.fps_den, preview_settings.max_width, preview_settings.max_frames);
+    const prvw = try buildPreviewPayload(trimmed_raw, base_dims.width, base_dims.height, frame_count, codec_rate.fps_num, codec_rate.fps_den, preview_settings.max_width, preview_settings.max_frames);
     defer allocator.free(prvw);
     const modl = try loadModelPayload(model_path);
     defer allocator.free(modl);
@@ -269,12 +275,16 @@ fn cmdEncode(args: []const []const u8) !void {
 
     try writeNvc(output, head, &chunks);
     std.debug.print("encoded {s} -> {s}\n", .{ input, output });
-    std.debug.print("profile={s} source={d}x{d} base={d}x{d} frames={d} raw_base={d} coded_base={d} qY={d} qUV={d}\n", .{
+    std.debug.print("profile={s} source={d}x{d}@{d}/{d} base={d}x{d}@{d}/{d} frames={d} raw_base={d} coded_base={d} qY={d} qUV={d}\n", .{
         profile.label(),
         probe.width,
         probe.height,
+        probe.fps_num,
+        probe.fps_den,
         base_dims.width,
         base_dims.height,
+        codec_rate.fps_num,
+        codec_rate.fps_den,
         frame_count,
         trimmed_raw.len,
         base_build.coded_size,
@@ -683,7 +693,7 @@ fn parseRate(text: []const u8, probe: *VideoProbe) void {
 fn chooseBaseDimensions(profile: Profile, width: u32, height: u32) struct { width: u32, height: u32 } {
     const divisor: u32 = switch (profile) {
         .w1 => 2,
-        .xc => 4,
+        .xc => 6,
     };
     return .{ .width = evenAtLeast2(width / divisor), .height = evenAtLeast2(height / divisor) };
 }
@@ -691,22 +701,35 @@ fn chooseBaseDimensions(profile: Profile, width: u32, height: u32) struct { widt
 fn chooseBaseQuant(profile: Profile) struct { y: u32, uv: u32 } {
     return switch (profile) {
         .w1 => .{ .y = 8, .uv = 16 },
-        .xc => .{ .y = 18, .uv = 32 },
+        .xc => .{ .y = 32, .uv = 56 },
     };
 }
 
 fn chooseBaseGopSize(profile: Profile) u32 {
     return switch (profile) {
         .w1 => 15,
-        .xc => 30,
+        .xc => 60,
     };
 }
 
 fn choosePreviewSettings(profile: Profile) struct { max_width: u32, max_frames: u32 } {
     return switch (profile) {
         .w1 => .{ .max_width = 96, .max_frames = 90 },
-        .xc => .{ .max_width = 48, .max_frames = 30 },
+        .xc => .{ .max_width = 32, .max_frames = 12 },
     };
+}
+
+fn chooseCodecRate(profile: Profile, fps_num: u32, fps_den: u32) CodecRate {
+    const safe_num = if (fps_num == 0) 30 else fps_num;
+    const safe_den = if (fps_den == 0) 1 else fps_den;
+    const cap: u32 = switch (profile) {
+        .w1 => 30,
+        .xc => 12,
+    };
+    if (@as(u64, safe_num) <= @as(u64, cap) * @as(u64, safe_den)) {
+        return .{ .fps_num = safe_num, .fps_den = safe_den };
+    }
+    return .{ .fps_num = cap, .fps_den = 1 };
 }
 
 fn evenAtLeast2(value: u32) u32 {
@@ -795,7 +818,7 @@ fn runChecked(argv: []const []const u8, max_output: usize) ![]u8 {
     return result.stdout;
 }
 
-fn buildHeadPayload(profile: Profile, probe: VideoProbe, base_width: u32, base_height: u32, frame_count: u32) ![]u8 {
+fn buildHeadPayload(profile: Profile, probe: VideoProbe, base_width: u32, base_height: u32, frame_count: u32, codec_fps_num: u32, codec_fps_den: u32) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\profile={s}
         \\width={d}
@@ -805,11 +828,13 @@ fn buildHeadPayload(profile: Profile, probe: VideoProbe, base_width: u32, base_h
         \\duration_ms={d}
         \\base_width={d}
         \\base_height={d}
+        \\source_fps_num={d}
+        \\source_fps_den={d}
         \\frames={d}
         \\color=yuv420p
         \\status=alpha-container-base-codec
         \\
-    , .{ profile.label(), probe.width, probe.height, probe.fps_num, probe.fps_den, probe.duration_ms, base_width, base_height, frame_count });
+    , .{ profile.label(), probe.width, probe.height, codec_fps_num, codec_fps_den, probe.duration_ms, base_width, base_height, probe.fps_num, probe.fps_den, frame_count });
 }
 
 fn buildMetaPayload(input: []const u8, output: []const u8, raw_len: usize, coded_len: usize, y_quant: u32, uv_quant: u32, gop_size: u32, packet_count: u32) ![]u8 {
@@ -2530,6 +2555,20 @@ test "quarter-turn rotation detection" {
     try std.testing.expect(isQuarterTurn(270));
     try std.testing.expect(!isQuarterTurn(0));
     try std.testing.expect(!isQuarterTurn(180));
+}
+
+test "profile rate caps and XC base settings" {
+    const w1_rate = chooseCodecRate(.w1, 60, 1);
+    try std.testing.expectEqual(@as(u32, 30), w1_rate.fps_num);
+    try std.testing.expectEqual(@as(u32, 1), w1_rate.fps_den);
+
+    const xc_rate = chooseCodecRate(.xc, 30000, 1001);
+    try std.testing.expectEqual(@as(u32, 12), xc_rate.fps_num);
+    try std.testing.expectEqual(@as(u32, 1), xc_rate.fps_den);
+
+    const dims = chooseBaseDimensions(.xc, 1920, 1080);
+    try std.testing.expectEqual(@as(u32, 320), dims.width);
+    try std.testing.expectEqual(@as(u32, 180), dims.height);
 }
 
 test "entropy coder roundtrip" {

@@ -166,7 +166,7 @@ Use this for realtime web playback.
 ./zig-out/bin/nvc encode input.mp4 output.nvc --profile w1
 ```
 
-The alpha W1 encoder uses a half-resolution base stream. A 1920x1080 video becomes a 960x540 base stream.
+The alpha W1 encoder uses a half-resolution base stream and caps the coded stream at 30 fps. A 1920x1080 video becomes a 960x540 base stream.
 
 ### NVC-XC
 
@@ -176,7 +176,7 @@ Use this for smaller files when slower encoding is okay.
 ./zig-out/bin/nvc encode input.mp4 output.nvc --profile xc
 ```
 
-The alpha XC encoder uses a quarter-resolution base stream. A 1920x1080 video becomes a 480x270 base stream. Future XC builds will add stronger neural and feature-level compression.
+The alpha XC encoder uses a one-sixth-resolution base stream, caps the coded stream at 12 fps, uses heavier quantization, and stores only a tiny sampled preview. A 1920x1080 video becomes a 320x180 base stream. This is much smaller than W1, but it is more lossy and depends more on neural reconstruction.
 
 ## Project Structure
 

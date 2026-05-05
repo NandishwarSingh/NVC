@@ -530,8 +530,8 @@ function setStatus(node: HTMLElement, message: string, error = false): void {
 function updateProfileNote(): void {
   const isXc = encodeProfile.value === "xc";
   profileNote.innerHTML = isXc
-    ? "<strong>NVC-XC</strong><span>Maximum compression. Uses a smaller base stream, slower encode, and more neural reconstruction.</span>"
-    : "<strong>NVC-W1</strong><span>Realtime web playback target. Uses a larger base stream, faster decode, and usually bigger files.</span>";
+    ? "<strong>NVC-XC</strong><span>Maximum compression. Uses a very small base stream, 12 fps cap, heavier quantization, and more neural reconstruction.</span>"
+    : "<strong>NVC-W1</strong><span>Realtime web playback target. Keeps up to 30 fps, uses a larger base stream, and usually makes bigger files.</span>";
 }
 
 function formatTime(seconds: number, preview: PreviewInfo | null): string {

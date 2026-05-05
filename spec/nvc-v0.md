@@ -40,7 +40,7 @@ offset  size  name
 
 ## Standard Chunks
 
-- `HEAD`: text metadata for profile, source dimensions, base dimensions, fps, frame count, and alpha status.
+- `HEAD`: text metadata for profile, source dimensions, base dimensions, coded fps, optional source fps, frame count, and alpha status.
 - `TOC0`: streamable table of contents for later chunks.
 - `PRVW`: compact browser preview stream for instant playback while the full `BASE` stream decoder initializes.
 - `MODL`: bundled neural model data. Current alpha supports `MOD0`.
@@ -370,11 +370,11 @@ offset  size  name
 
 ### NVC-W1
 
-The web profile targets realtime playback. In alpha, 1080p sources are downscaled to a 540p base stream.
+The web profile targets realtime playback. In alpha, 1080p sources are downscaled to a 540p base stream and coded at up to 30 fps.
 
 ### NVC-XC
 
-The extreme compression profile allows slower encoding and lower base resolutions. In alpha, it uses a quarter-resolution base stream.
+The extreme compression profile allows slower encoding, lower base resolutions, lower coded frame rates, and heavier quantization. In alpha, it uses a one-sixth-resolution base stream, caps the coded stream at 12 fps, and stores only a tiny sampled preview.
 
 ## Future v0 Milestones
 
