@@ -1,4 +1,4 @@
-import { decodeBaseFrame, decodeCodecBaseFrame, decodeNeuralFrame, ensureNvcBasePacket, ensureNvcChunk, getPreviewInfo, loadNvcUrl, parseNvc, type NvcFile, type NvcLoadStats, type PreviewInfo } from "./nvc";
+import { decodeBaseFrame, decodeCodecBaseFrame, decodeNeuralFrame, decodeNeuralFrameOnnx, ensureNvcBasePacket, ensureNvcChunk, getPreviewInfo, loadNvcUrl, parseNvc, prepareBaseDecode, type NvcFile, type NvcLoadStats, type PreviewInfo } from "./nvc";
 
 type PlayerOptions = {
   canvas: HTMLCanvasElement;
@@ -18,6 +18,11 @@ export class NVCPlayer extends EventTarget {
   private playing = false;
   private timer: number | null = null;
   private frameDisplaySize: { width: number; height: number } | null = null;
+  // True when the loaded file is XC profile. We keep parser + decoders intact (they still
+  // run for the Decode tool's server-side path), but we skip in-browser playback because
+  // TinySR x2 can't recover a 4× ratio cleanly. UI shows an info panel instead.
+  private isXc = false;
+  private fileName = "";
   private readonly handleResize = () => this.resizeCanvasDisplay();
 
   constructor(options: PlayerOptions) {
@@ -35,6 +40,8 @@ export class NVCPlayer extends EventTarget {
     this.parsed = parseNvc(buffer);
     this.preview = getPreviewInfo(this.parsed);
     this.frameIndex = 0;
+    this.fileName = file.name || "input.nvc";
+    this.detectProfile(file.size);
     this.emitStats({
       loadMode: "full",
       bytesLoaded: buffer.byteLength,
@@ -42,6 +49,7 @@ export class NVCPlayer extends EventTarget {
       chunksLoaded: this.parsed.chunks.map((chunk) => chunk.id),
     });
     this.dispatchEvent(new CustomEvent("ready", { detail: this.parsed }));
+    if (this.isXc) return; // skip canvas; UI shows info panel instead
     await this.renderFrame(0);
   }
 
@@ -51,18 +59,64 @@ export class NVCPlayer extends EventTarget {
     this.parsed = result.file;
     this.preview = getPreviewInfo(this.parsed);
     this.frameIndex = 0;
+    const slash = url.lastIndexOf("/");
+    this.fileName = slash >= 0 ? url.slice(slash + 1) : url;
+    this.detectProfile(result.stats.fileBytes ?? 0);
     this.dispatchEvent(new CustomEvent("ready", { detail: this.parsed }));
+    if (this.isXc) return;
     await this.renderFrame(0);
   }
 
+  isXcProfile(): boolean {
+    return this.isXc;
+  }
+
+  getFileName(): string {
+    return this.fileName;
+  }
+
+  private detectProfile(fileBytes: number): void {
+    if (!this.parsed) return;
+    const profile = (this.parsed.head.profile || "").toUpperCase();
+    this.isXc = profile.includes("XC");
+    const head = this.parsed.head;
+    this.dispatchEvent(
+      new CustomEvent("profile", {
+        detail: {
+          profile,
+          isXc: this.isXc,
+          fileName: this.fileName,
+          fileBytes,
+          frames: Number(head.frames || 0),
+          baseWidth: Number(head.base_width || 0),
+          baseHeight: Number(head.base_height || 0),
+          sourceWidth: Number(head.width || 0),
+          sourceHeight: Number(head.height || 0),
+          fpsNum: Number(head.fps_num || 30),
+          fpsDen: Number(head.fps_den || 1),
+        },
+      }),
+    );
+  }
+
   async setRenderMode(mode: RenderMode): Promise<void> {
+    if (this.isXc && (mode === "codec" || mode === "neural")) {
+      // Hard-block: in-browser Codec/Neural for XC produces ¼-resolution+CSS-stretched output
+      // that misrepresents the codec. Tell the user where the real quality is.
+      this.dispatchEvent(
+        new CustomEvent("xc-blocked", {
+          detail: { mode, suggestion: `nvc decode ${this.fileName} out.mp4 --enhancer realesrgan --interpolate-rife` },
+        }),
+      );
+      return;
+    }
     this.renderMode = mode;
     if (mode !== "preview") this.pause();
-    if (this.parsed) await this.renderFrame(this.frameIndex);
+    if (this.parsed && !this.isXc) await this.renderFrame(this.frameIndex);
   }
 
   async seek(seconds: number): Promise<void> {
-    if (!this.preview) return;
+    if (!this.preview || this.isXc) return;
     const fps = previewFps(this.preview);
     const index = Math.max(0, Math.min(this.preview.frameCount - 1, Math.round(seconds * fps)));
     await this.renderFrame(index);
@@ -74,10 +128,7 @@ export class NVCPlayer extends EventTarget {
     this.frameIndex = Math.max(0, Math.min(maxIndex, index));
     this.dispatchEvent(new CustomEvent("buffering", { detail: { mode: this.renderMode } }));
     if (this.renderMode === "codec" || this.renderMode === "neural") await this.ensureBasePacket(this.frameIndex);
-    const neural =
-      this.renderMode === "neural"
-        ? await decodeNeuralFrame(this.parsed, this.frameIndex, { maxInputWidth: 480, cpuMaxInputWidth: 160, preferWebGPU: this.preferWebGPU, webGpuTimeoutMs: 3000, preferCodecInput: true })
-        : null;
+    const neural = this.renderMode === "neural" ? await this.runNeural() : null;
     const firstFrame = neural ? neural.imageData : this.renderMode === "codec" ? decodeCodecBaseFrame(this.parsed, this.frameIndex) : decodeBaseFrame(this.parsed, this.frameIndex);
     this.canvas.width = firstFrame.width;
     this.canvas.height = firstFrame.height;
@@ -102,6 +153,7 @@ export class NVCPlayer extends EventTarget {
   }
 
   play(): void {
+    if (this.isXc) return; // no in-browser playback for XC
     if (!this.preview || this.preview.frameCount <= 1 || this.playing) return;
     this.playing = true;
     this.dispatchEvent(new Event("play"));
@@ -161,10 +213,37 @@ export class NVCPlayer extends EventTarget {
     if (stats) this.emitStats(stats);
   }
 
+  // Neural mode tries the bigger ORT-Web realesr-animevideov3 model first (~2.5 MB,
+  // matches the CLI's --enhancer realesrgan output), falls back to the bundled MOD0
+  // TinySR (~5K params) if ORT fails to load (no WebGPU + no WASM, model fetch error,
+  // etc.). Either way the user sees a Neural-mode frame.
+  private async runNeural() {
+    if (!this.parsed) throw new Error("no parsed file");
+    try {
+      return await decodeNeuralFrameOnnx(this.parsed, this.frameIndex, { preferCodecInput: true });
+    } catch (error) {
+      this.dispatchEvent(
+        new CustomEvent("neural-fallback", {
+          detail: { reason: error instanceof Error ? error.message : String(error) },
+        }),
+      );
+      return decodeNeuralFrame(this.parsed, this.frameIndex, {
+        maxInputWidth: 480,
+        cpuMaxInputWidth: 160,
+        preferWebGPU: this.preferWebGPU,
+        webGpuTimeoutMs: 3000,
+        preferCodecInput: true,
+      });
+    }
+  }
+
   private async ensureBasePacket(frameIndex: number): Promise<void> {
     if (!this.parsed) return;
     const stats = await ensureNvcBasePacket(this.parsed, frameIndex);
     if (stats) this.emitStats(stats);
+    // For BAS6 files, the BASE chunk is a single VP9 IVF bitstream; pre-decode all frames
+    // through WebCodecs into a sync ImageData cache before Codec/Neural decode can run.
+    await prepareBaseDecode(this.parsed);
   }
 
   private emitStats(stats: NvcLoadStats): void {
@@ -201,6 +280,11 @@ const decodeFileName = document.querySelector<HTMLElement>("#decodeFileName");
 const decodeSubmit = document.querySelector<HTMLButtonElement>("#decodeSubmit");
 const decodeStatus = document.querySelector<HTMLElement>("#decodeStatus");
 const decodedVideo = document.querySelector<HTMLVideoElement>("#decodedVideo");
+const xcPanel = document.querySelector<HTMLElement>("#xcPanel");
+const xcStats = document.querySelector<HTMLElement>("#xcStats");
+const xcFileNameEl = document.querySelector<HTMLElement>("#xcFileName");
+const canvasWrap = document.querySelector<HTMLElement>(".canvas-wrap");
+const segmentedBar = document.querySelector<HTMLElement>(".segmented");
 
 if (
   !canvas ||
@@ -240,6 +324,68 @@ webgpu.textContent =
     ? "WebGPU API detected. Neural mode reconstructs from codec base packets first, then CPU fallback."
     : "WebGPU API not detected. CPU MOD0 neural reconstruction is active.";
 updateProfileNote();
+
+player.addEventListener("profile", (event) => {
+  const d = (event as CustomEvent<{
+    profile: string;
+    isXc: boolean;
+    fileName: string;
+    fileBytes: number;
+    frames: number;
+    baseWidth: number;
+    baseHeight: number;
+    sourceWidth: number;
+    sourceHeight: number;
+    fpsNum: number;
+    fpsDen: number;
+  }>).detail;
+
+  if (xcPanel && xcStats && xcFileNameEl && canvasWrap && segmentedBar) {
+    if (d.isXc) {
+      const fps = d.fpsDen > 0 ? d.fpsNum / d.fpsDen : 30;
+      const durationSec = fps > 0 ? d.frames / fps : 0;
+      const sizeMB = d.fileBytes / (1024 * 1024);
+      const ratio = d.frames && d.fileBytes ? estimateSourceMB(d.sourceWidth, d.sourceHeight, durationSec) / sizeMB : 0;
+      xcStats.innerHTML = "";
+      pushStat(xcStats, sizeMB.toFixed(2) + " MB", `this .nvc on disk (${d.fileName})`);
+      pushStat(xcStats, `${d.sourceWidth}×${d.sourceHeight}`, `source dims, ${d.frames} frames @ ${fps.toFixed(0)} fps`);
+      pushStat(xcStats, `${d.baseWidth}×${d.baseHeight}`, `1/4-res base, VP9 IVF inside .nvc`);
+      if (ratio > 0) pushStat(xcStats, `~${ratio.toFixed(1)}×`, "smaller than the source MP4 (estimated)");
+      xcFileNameEl.textContent = d.fileName;
+      xcPanel.hidden = false;
+      canvasWrap.classList.add("xc-mode");
+      segmentedBar.classList.add("xc-mode");
+    } else {
+      xcPanel.hidden = true;
+      canvasWrap.classList.remove("xc-mode");
+      segmentedBar.classList.remove("xc-mode");
+    }
+  }
+});
+
+function pushStat(host: HTMLElement, big: string, sub: string): void {
+  const li = document.createElement("li");
+  const strong = document.createElement("strong");
+  strong.textContent = big;
+  const span = document.createElement("span");
+  span.textContent = sub;
+  li.append(strong, span);
+  host.append(li);
+}
+
+function estimateSourceMB(w: number, h: number, sec: number): number {
+  // Rough heuristic: assume the source MP4 was ~4 Mbps for typical phone video.
+  // Used only to display an "approx ratio". Honest with itself; flagged "estimated".
+  const bitsPerSec = 4_000_000;
+  return (bitsPerSec * sec) / 8 / (1024 * 1024);
+}
+
+player.addEventListener("xc-blocked", (event) => {
+  const d = (event as CustomEvent<{ mode: RenderMode; suggestion: string }>).detail;
+  if (log) {
+    log.textContent = `XC files don't play in-browser cleanly (${d.mode} mode would only run a 5K-param SR model on a 1/4-res base, then CSS-stretch).\nFor full quality run the CLI:\n  ${d.suggestion}`;
+  }
+});
 
 player.addEventListener("ready", (event) => {
   const parsed = (event as CustomEvent<NvcFile>).detail;
@@ -309,7 +455,7 @@ player.addEventListener("buffering", (event) => {
     mode === "neural"
       ? "Running MOD0 TinySR neural reconstruction..."
       : mode === "codec"
-        ? "Decoding native BAS5 packet..."
+        ? "Decoding base stream (VP9 via WebCodecs / BAS5 fallback)..."
         : "Decoding PRVW preview...";
 });
 
@@ -530,7 +676,7 @@ function setStatus(node: HTMLElement, message: string, error = false): void {
 function updateProfileNote(): void {
   const isXc = encodeProfile.value === "xc";
   profileNote.innerHTML = isXc
-    ? "<strong>NVC-XC</strong><span>Maximum compression. Uses a very small base stream, 12 fps cap, heavier quantization, and more neural reconstruction.</span>"
+    ? "<strong>NVC-XC</strong><span>Maximum compression. Uses a quarter-resolution base stream, 12 fps cap, heavier quantization, and more neural reconstruction.</span>"
     : "<strong>NVC-W1</strong><span>Realtime web playback target. Keeps up to 30 fps, uses a larger base stream, and usually makes bigger files.</span>";
 }
 

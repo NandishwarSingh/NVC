@@ -35,6 +35,10 @@
           <strong>+10.6</strong>
           <span>VMAF gain from CLI Real-ESRGAN on W1 natural content.</span>
         </div>
+        <div class="stat">
+          <strong>Self-contained</strong>
+          <span>Every .nvc file ships its own super-resolution model.</span>
+        </div>
       </section>
 
       <section class="workspace">
@@ -84,6 +88,28 @@
             <p id="decodeStatus" class="status-line">Idle</p>
             <video id="decodedVideo" class="decoded-video" controls hidden></video>
           </form>
+
+          <section class="stats-card" aria-label="NVC benchmark highlights">
+            <div class="card-head">
+              <span class="step">Stats</span>
+              <strong>What NVC can do</strong>
+            </div>
+            <div class="stat-list">
+              <div>
+                <span>16 h</span>
+                <p>Natural 1024x576 video in about 325 MB at measured XC rate.</p>
+              </div>
+              <div>
+                <span>21x</span>
+                <p>Smaller than the WhatsApp MP4 benchmark clip.</p>
+              </div>
+              <div>
+                <span>+10.6</span>
+                <p>VMAF gain from CLI Real-ESRGAN on W1 natural content.</p>
+              </div>
+            </div>
+            <a class="stats-link" href="https://github.com/NandishwarSingh/NVC/blob/main/STATS.md" target="_blank" rel="noreferrer">Read benchmark notes</a>
+          </section>
         </aside>
 
         <section class="stage">
@@ -114,6 +140,24 @@
                   </label>
                   <button id="loadSample" type="button">Sample</button>
                 </div>
+              </div>
+              <div id="xcPanel" class="xc-panel" hidden>
+                <div class="xc-headline">
+                  <span class="step">Profile</span>
+                  <strong>NVC-XC — extreme compression</strong>
+                </div>
+                <p class="xc-lede">
+                  This file uses the XC profile. It's optimized for offline storage &mdash; up to <em>21× smaller</em>
+                  than the source MP4 &mdash; not in-browser playback.
+                  The browser's tiny SR model can't do justice to a 1/4-resolution base; the CLI's full Real-ESRGAN-x4plus
+                  + RIFE pipeline can.
+                </p>
+                <ul class="xc-stats" id="xcStats"></ul>
+                <div class="xc-cli">
+                  <span>Decode at full quality:</span>
+                  <code>nvc decode <span id="xcFileName">this.nvc</span> out.mp4 --enhancer realesrgan --interpolate-rife</code>
+                </div>
+                <p class="xc-fallback">Or use the <strong>Decode</strong> tool on the left to download a playable MP4.</p>
               </div>
             </div>
 

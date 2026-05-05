@@ -208,6 +208,21 @@ const server = Bun.serve({
     if (url.pathname === "/samples/output.nvc") {
       return serveFile(req, Bun.file(new URL("../samples/output.nvc", root)), "application/octet-stream");
     }
+    if (url.pathname === "/models/realesrgan-anime-x4.onnx") {
+      return serveFile(req, Bun.file(new URL("../ml/exports/nvc-realesrgan-anime-x4.onnx", root)), "application/octet-stream");
+    }
+    // ORT-Web ships its WebAssembly runtime as separate .wasm files. Serve them straight
+    // from the installed package so the browser can fetch them with the right MIME type.
+    if (url.pathname.startsWith("/ort/") && url.pathname.endsWith(".wasm")) {
+      const name = url.pathname.slice(5);
+      const wasmFile = Bun.file(new URL(`./node_modules/onnxruntime-web/dist/${name}`, root));
+      return serveFile(req, wasmFile, "application/wasm");
+    }
+    if (url.pathname.startsWith("/ort/") && url.pathname.endsWith(".mjs")) {
+      const name = url.pathname.slice(5);
+      const mjs = Bun.file(new URL(`./node_modules/onnxruntime-web/dist/${name}`, root));
+      return serveFile(req, mjs, "text/javascript");
+    }
     return new Response("Not found", { status: 404 });
   },
 });

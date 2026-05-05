@@ -23,6 +23,18 @@ export type NvcFile = {
   baseFrameCache?: BaseFrameCache;
   baseFrameCaches?: Map<number, BaseFrameCache>;
   baseFrameCacheOrder?: number[];
+  bas6Cache?: Bas6Cache;
+  bas6Pending?: Promise<void>;
+};
+
+export type Bas6Cache = {
+  width: number;
+  height: number;
+  fpsNum: number;
+  fpsDen: number;
+  frameCount: number;
+  crf: number;
+  frames: BaseRgbFrame[];
 };
 
 export type NvcLoadStats = {
@@ -603,6 +615,148 @@ export async function decodeFirstNeuralFrame(
   return decodeNeuralFrame(file, 0, options);
 }
 
+// ── ORT-Web realesr-animevideov3 (x4 weights) integration ────────────────────
+// Lazy-loads onnxruntime-web on first call so we don't pay the JS+wasm cost up
+// front for users who never enter Neural+ mode. Caches the InferenceSession so
+// every subsequent frame reuses the same compiled graph + GPU pipeline.
+type OrtNamespace = typeof import("onnxruntime-web");
+let ortPromise: Promise<OrtNamespace> | null = null;
+let ortSessionPromise: Promise<unknown> | null = null;
+let ortBackendUsed: "webgpu" | "wasm" | null = null;
+
+const REALESRGAN_ONNX_URL = "/models/realesrgan-anime-x4.onnx";
+const REALESRGAN_INPUT_NAME = "lr_rgb";
+
+async function loadOrt(): Promise<OrtNamespace> {
+  if (!ortPromise) {
+    ortPromise = (async () => {
+      const ort = (await import("onnxruntime-web")) as OrtNamespace;
+      // Tell ORT-Web where to find its wasm runtime files (the dev server proxies them
+      // from node_modules/onnxruntime-web/dist via /ort/*).
+      (ort.env as { wasm: { wasmPaths?: string } }).wasm.wasmPaths = "/ort/";
+      return ort;
+    })();
+  }
+  return ortPromise;
+}
+
+async function getRealEsrganSession(): Promise<unknown> {
+  if (!ortSessionPromise) {
+    ortSessionPromise = (async () => {
+      const ort = await loadOrt();
+      // WebGPU first; fall back to WASM/SIMD if WebGPU isn't available or rejects the model.
+      try {
+        const session = await ort.InferenceSession.create(REALESRGAN_ONNX_URL, {
+          executionProviders: ["webgpu", "wasm"],
+        });
+        ortBackendUsed = "webgpu";
+        return session;
+      } catch {
+        const session = await ort.InferenceSession.create(REALESRGAN_ONNX_URL, {
+          executionProviders: ["wasm"],
+        });
+        ortBackendUsed = "wasm";
+        return session;
+      }
+    })();
+  }
+  return ortSessionPromise;
+}
+
+function rgbToPlanarFloat(rgb: Uint8ClampedArray, w: number, h: number): Float32Array {
+  const out = new Float32Array(3 * h * w);
+  const plane = h * w;
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const src = (y * w + x) * 3;
+      const dst = y * w + x;
+      out[dst] = rgb[src] / 255;
+      out[plane + dst] = rgb[src + 1] / 255;
+      out[2 * plane + dst] = rgb[src + 2] / 255;
+    }
+  }
+  return out;
+}
+
+function planarFloatToImageData(data: Float32Array, w: number, h: number): ImageData {
+  const out = new Uint8ClampedArray(w * h * 4);
+  const plane = h * w;
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const src = y * w + x;
+      const dst = src * 4;
+      out[dst] = Math.max(0, Math.min(255, Math.round(data[src] * 255)));
+      out[dst + 1] = Math.max(0, Math.min(255, Math.round(data[plane + src] * 255)));
+      out[dst + 2] = Math.max(0, Math.min(255, Math.round(data[2 * plane + src] * 255)));
+      out[dst + 3] = 255;
+    }
+  }
+  return new ImageData(out, w, h);
+}
+
+// Pre-downscale the base to half its width so the x4 model effectively gives x2 reconstruction
+// at the source resolution, matching what realesrgan-ncnn-vulkan -s 2 produces in the CLI.
+function halveBaseFrame(base: BaseRgbFrame): BaseRgbFrame {
+  const dstW = Math.max(2, base.width >> 1);
+  const dstH = Math.max(2, base.height >> 1);
+  const out = new Uint8ClampedArray(dstW * dstH * 3);
+  for (let y = 0; y < dstH; y += 1) {
+    const sy0 = Math.min(base.height - 1, y * 2);
+    const sy1 = Math.min(base.height - 1, sy0 + 1);
+    for (let x = 0; x < dstW; x += 1) {
+      const sx0 = Math.min(base.width - 1, x * 2);
+      const sx1 = Math.min(base.width - 1, sx0 + 1);
+      const dst = (y * dstW + x) * 3;
+      for (let c = 0; c < 3; c += 1) {
+        out[dst + c] = Math.round(
+          (base.rgb[(sy0 * base.width + sx0) * 3 + c] +
+            base.rgb[(sy0 * base.width + sx1) * 3 + c] +
+            base.rgb[(sy1 * base.width + sx0) * 3 + c] +
+            base.rgb[(sy1 * base.width + sx1) * 3 + c]) /
+            4,
+        );
+      }
+    }
+  }
+  return { width: dstW, height: dstH, rgb: out };
+}
+
+export async function decodeNeuralFrameOnnx(
+  file: NvcFile,
+  frameIndex = 0,
+  options: { preferCodecInput?: boolean } = {},
+): Promise<NeuralRenderResult> {
+  const ort = await loadOrt();
+  const session = (await getRealEsrganSession()) as InstanceType<OrtNamespace["InferenceSession"]>;
+  const fullBase = decodeFirstBaseRgb(file, frameIndex, !(options.preferCodecInput ?? false));
+  // The shipped weights are x4. For W1's natural x2 use case we halve the base on input so
+  // model output lands at source resolution (x2 effective). For lower-ratio bases the canvas
+  // CSS-fits whatever we produce.
+  const base = halveBaseFrame(fullBase);
+  const planar = rgbToPlanarFloat(base.rgb, base.width, base.height);
+  const tensor = new ort.Tensor("float32", planar, [1, 3, base.height, base.width]);
+  const feeds: Record<string, InstanceType<OrtNamespace["Tensor"]>> = {};
+  feeds[REALESRGAN_INPUT_NAME] = tensor;
+  const out = await session.run(feeds);
+  const outputName = (session as { outputNames?: string[] }).outputNames?.[0] ?? Object.keys(out)[0];
+  const outTensor = out[outputName];
+  const dims = outTensor.dims as readonly number[];
+  const outH = Number(dims[2]);
+  const outW = Number(dims[3]);
+  const outData = outTensor.data as Float32Array;
+  const imageData = planarFloatToImageData(outData, outW, outH);
+  applyReconstructionTuning(file, imageData, frameIndex, fullBase);
+  return {
+    imageData,
+    backend: ortBackendUsed === "webgpu" ? "webgpu" : "cpu",
+    inputWidth: base.width,
+    inputHeight: base.height,
+    outputWidth: outW,
+    outputHeight: outH,
+    fallbackReason: ortBackendUsed === "wasm" ? "WebGPU unavailable; running on WASM" : undefined,
+  };
+}
+
 export async function decodeNeuralFrame(
   file: NvcFile,
   frameIndex = 0,
@@ -778,6 +932,7 @@ function decodeFirstBaseRgb(file: NvcFile, frameIndex = 0, preferPreview = true)
   if (!base) throw new Error("BASE chunk missing");
   const payload = base.payload;
   const magic = readText(payload, 0, 4);
+  if (magic === "BAS6") return decodeBas6FrameRgb(file, frameIndex);
   if (magic === "BAS5") return decodeBas5FrameRgb(file, payload, frameIndex);
   const frame =
     magic === "BAS0"
@@ -792,6 +947,188 @@ function decodeFirstBaseRgb(file: NvcFile, frameIndex = 0, preferPreview = true)
               ? decodeBas4FirstYuv(payload)
         : unsupportedBase(magic);
   return yuv420ToRgb(frame);
+}
+
+export type Bas6HeaderInfo = {
+  width: number;
+  height: number;
+  fpsNum: number;
+  fpsDen: number;
+  frameCount: number;
+  rawSize: number;
+  codedSize: number;
+  crf: number;
+  targetBitrateKbps: number;
+};
+
+export function readBas6Header(payload: Uint8Array): Bas6HeaderInfo {
+  if (payload.length < 56 || readText(payload, 0, 4) !== "BAS6") {
+    throw new Error("Not a BAS6 BASE chunk");
+  }
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  return {
+    width: view.getUint32(8, true),
+    height: view.getUint32(12, true),
+    fpsNum: view.getUint32(16, true),
+    fpsDen: view.getUint32(20, true),
+    frameCount: view.getUint32(24, true),
+    rawSize: Number(view.getBigUint64(28, true)),
+    codedSize: Number(view.getBigUint64(36, true)),
+    crf: view.getUint32(44, true),
+    targetBitrateKbps: view.getUint32(48, true),
+  };
+}
+
+type IvfFrame = { pts: bigint; data: Uint8Array };
+
+function demuxIvf(bytes: Uint8Array): IvfFrame[] {
+  if (bytes.length < 32 || readText(bytes, 0, 4) !== "DKIF") {
+    throw new Error("Invalid IVF stream (missing DKIF header)");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const headerLen = view.getUint16(6, true);
+  const frames: IvfFrame[] = [];
+  let cursor = headerLen;
+  while (cursor + 12 <= bytes.length) {
+    const frameLen = view.getUint32(cursor, true);
+    const pts = view.getBigUint64(cursor + 4, true);
+    const dataStart = cursor + 12;
+    const dataEnd = dataStart + frameLen;
+    if (dataEnd > bytes.length) throw new Error("Truncated IVF frame");
+    frames.push({ pts, data: bytes.slice(dataStart, dataEnd) });
+    cursor = dataEnd;
+  }
+  return frames;
+}
+
+function isVp9Keyframe(frame: Uint8Array): boolean {
+  if (frame.length < 1) return false;
+  const b = frame[0];
+  // VP9 uncompressed header reads bits MSB-first from byte 0:
+  //   bits 7..6 = frame_marker (0b10)
+  //   bit 5     = profile_low_bit
+  //   bit 4     = profile_high_bit
+  //   bit 3     = show_existing_frame (skip the rest if 1)
+  //   bit 2     = frame_type (0 = key, 1 = inter)
+  //   bit 1     = show_frame
+  //   bit 0     = error_resilient_mode
+  // For 10/12-bit (profile 2/3) the layout is the same up to and including frame_type.
+  const showExisting = (b >> 3) & 1;
+  if (showExisting === 1) return false;
+  const frameType = (b >> 2) & 1;
+  return frameType === 0;
+}
+
+function decodeBas6FrameRgb(file: NvcFile, frameIndex: number): BaseRgbFrame {
+  const cache = file.bas6Cache;
+  if (!cache) {
+    throw new Error("BAS6 frame cache not ready; call prepareBaseDecode(file) before sync decode");
+  }
+  if (cache.frames.length === 0) throw new Error("BAS6 cache has no frames");
+  const target = Math.max(0, Math.min(cache.frames.length - 1, Math.trunc(frameIndex)));
+  return cache.frames[target];
+}
+
+export async function prepareBaseDecode(file: NvcFile): Promise<void> {
+  if (file.bas6Cache) return;
+  if (file.bas6Pending) return file.bas6Pending;
+  const base = file.chunks.find((chunk) => chunk.id === "BASE");
+  if (!base) return; // no BASE yet (range-loaded, not fetched); caller handles later
+  const payload = base.payload;
+  if (readText(payload, 0, 4) !== "BAS6") return; // legacy formats decode synchronously
+  if (typeof (globalThis as { VideoDecoder?: unknown }).VideoDecoder !== "function") {
+    throw new Error("WebCodecs VideoDecoder unavailable; cannot decode BAS6 in this browser");
+  }
+
+  const pending = (async () => {
+    const header = readBas6Header(payload);
+    const ivfBytes = payload.subarray(56, 56 + header.codedSize);
+    const ivfFrames = demuxIvf(ivfBytes);
+    const decoded: BaseRgbFrame[] = [];
+    let pendingError: unknown = null;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+
+    const VideoDecoderCtor = (globalThis as unknown as { VideoDecoder: new (init: { output: (vf: VideoFrame) => void; error: (e: Error) => void }) => VideoDecoder }).VideoDecoder;
+    const decoder = new VideoDecoderCtor({
+      output: (videoFrame: VideoFrame) => {
+        try {
+          decoded.push(videoFrameToRgb(videoFrame, header.width, header.height));
+        } catch (err) {
+          pendingError = err;
+        } finally {
+          videoFrame.close();
+          if (decoded.length + (pendingError ? 1 : 0) >= ivfFrames.length && resolveDone) {
+            resolveDone();
+          }
+        }
+      },
+      error: (err: Error) => {
+        pendingError = err;
+        if (resolveDone) resolveDone();
+      },
+    });
+
+    // Use a permissive Level 4.1 in the codec string; browsers self-detect the actual stream
+    // level from the bitstream. Level 1.0 (the previous hardcoded value) was below what XC's
+    // smaller streams report (Level 1.1+) and Chrome rejected `configure()` for those.
+    decoder.configure({
+      codec: "vp09.00.41.08.01.01.01.01.00",
+      codedWidth: header.width,
+      codedHeight: header.height,
+    });
+
+    const fpsNum = Math.max(1, header.fpsNum);
+    const fpsDen = Math.max(1, header.fpsDen);
+    const microsPerFrame = Math.round((1_000_000 * fpsDen) / fpsNum);
+    for (let i = 0; i < ivfFrames.length; i += 1) {
+      const ivf = ivfFrames[i];
+      const isKey = i === 0 || isVp9Keyframe(ivf.data);
+      decoder.decode(new EncodedVideoChunk({
+        type: isKey ? "key" : "delta",
+        timestamp: i * microsPerFrame,
+        data: ivf.data,
+      }));
+    }
+    await decoder.flush();
+    decoder.close();
+    await done;
+
+    if (pendingError) throw pendingError instanceof Error ? pendingError : new Error(String(pendingError));
+    file.bas6Cache = {
+      width: header.width,
+      height: header.height,
+      fpsNum: header.fpsNum,
+      fpsDen: header.fpsDen,
+      frameCount: header.frameCount,
+      crf: header.crf,
+      frames: decoded,
+    };
+    file.bas6Pending = undefined;
+  })();
+  file.bas6Pending = pending;
+  return pending;
+}
+
+function videoFrameToRgb(vf: VideoFrame, width: number, height: number): BaseRgbFrame {
+  const w = vf.codedWidth || vf.displayWidth || width;
+  const h = vf.codedHeight || vf.displayHeight || height;
+  const Ctor = (globalThis as { OffscreenCanvas?: typeof OffscreenCanvas }).OffscreenCanvas;
+  if (!Ctor) throw new Error("OffscreenCanvas unavailable; cannot convert VideoFrame to RGB");
+  const canvas = new Ctor(w, h);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("OffscreenCanvas 2d context unavailable");
+  ctx.drawImage(vf, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h);
+  const rgb = new Uint8ClampedArray(w * h * 3);
+  for (let i = 0, j = 0; i < img.data.length; i += 4, j += 3) {
+    rgb[j] = img.data[i];
+    rgb[j + 1] = img.data[i + 1];
+    rgb[j + 2] = img.data[i + 2];
+  }
+  return { width: w, height: h, rgb };
 }
 
 export function getPreviewInfo(file: NvcFile): PreviewInfo | null {
