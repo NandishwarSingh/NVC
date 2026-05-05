@@ -1,5 +1,7 @@
 # NVC: Neural Video Codec
 
+**Live demo:** [nandishwarsingh.com/nvc](https://nandishwarsingh.com/nvc/) (or [nvc.nandishwarsingh.com](https://nvc.nandishwarsingh.com/)) — drop a video and play it back with WebGPU-accelerated neural reconstruction.
+
 NVC is an experimental neural-augmented video codec with its own `.nvc` file type. The goal is to compress video by storing a downscaled VP9 base stream plus neural reconstruction data that helps recover a visually accurate full-resolution video.
 
 This repo is an alpha implementation. It already creates and reads native `.nvc` files, includes a Zig CLI, includes a browser demo, and lays down the format/spec structure for the neural codec work. New here? Start with [HOW_TO_SETUP_FROM_SCRATCH.md](HOW_TO_SETUP_FROM_SCRATCH.md).
