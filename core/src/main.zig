@@ -159,7 +159,7 @@ fn printHelp() void {
         \\NVC alpha CLI
         \\
         \\Usage:
-        \\  nvc encode <input-video> <output.nvc> --profile w1|xc [--frames N] [--model PATH]
+        \\  nvc encode <input-video> <output.nvc> --profile w1|xc [--frames N|all] [--model PATH]
         \\  nvc decode <input.nvc> <output.mp4>
         \\  nvc info <input.nvc>
         \\  nvc inspect <input.nvc>
@@ -181,7 +181,7 @@ fn cmdEncode(args: []const []const u8) !void {
     const input = args[0];
     const output = args[1];
     var profile: Profile = .w1;
-    var frame_limit: u32 = 60;
+    var frame_limit: u32 = 0;
     var model_path: ?[]const u8 = null;
 
     var i: usize = 2;
@@ -192,7 +192,7 @@ fn cmdEncode(args: []const []const u8) !void {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--frames")) {
             if (i + 1 >= args.len) return error.InvalidArguments;
-            frame_limit = try std.fmt.parseInt(u32, args[i + 1], 10);
+            frame_limit = try parseFrameLimit(args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--model")) {
             if (i + 1 >= args.len) return error.InvalidArguments;
@@ -516,6 +516,11 @@ fn parseProfile(text: []const u8) !Profile {
     return error.InvalidProfile;
 }
 
+fn parseFrameLimit(text: []const u8) !u32 {
+    if (std.mem.eql(u8, text, "all") or std.mem.eql(u8, text, "full") or std.mem.eql(u8, text, "0")) return 0;
+    return std.fmt.parseInt(u32, text, 10);
+}
+
 fn baseCodecLabel(format: BaseFormat) []const u8 {
     return switch (format) {
         .rle => "BAS0-rle-legacy",
@@ -623,7 +628,7 @@ fn probeVideo(path: []const u8) !VideoProbe {
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,r_frame_rate:format=duration",
+        "stream=width,height,r_frame_rate:stream_tags=rotate:stream_side_data=rotation:format=duration",
         "-of",
         "default=noprint_wrappers=1",
         path,
@@ -632,6 +637,7 @@ fn probeVideo(path: []const u8) !VideoProbe {
     defer allocator.free(result);
 
     var probe = VideoProbe{};
+    var rotation: i32 = 0;
     var lines = std.mem.tokenizeScalar(u8, result, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "width=")) {
@@ -640,12 +646,26 @@ fn probeVideo(path: []const u8) !VideoProbe {
             probe.height = std.fmt.parseInt(u32, line["height=".len..], 10) catch probe.height;
         } else if (std.mem.startsWith(u8, line, "r_frame_rate=")) {
             parseRate(line["r_frame_rate=".len..], &probe);
+        } else if (std.mem.startsWith(u8, line, "TAG:rotate=")) {
+            rotation = std.fmt.parseInt(i32, line["TAG:rotate=".len..], 10) catch rotation;
+        } else if (std.mem.startsWith(u8, line, "rotation=")) {
+            rotation = std.fmt.parseInt(i32, line["rotation=".len..], 10) catch rotation;
         } else if (std.mem.startsWith(u8, line, "duration=")) {
             const seconds = std.fmt.parseFloat(f64, line["duration=".len..]) catch 0;
             if (seconds > 0) probe.duration_ms = @intFromFloat(seconds * 1000.0);
         }
     }
+    if (isQuarterTurn(rotation)) {
+        const width = probe.width;
+        probe.width = probe.height;
+        probe.height = width;
+    }
     return probe;
+}
+
+fn isQuarterTurn(rotation: i32) bool {
+    const normalized = @mod(rotation, 360);
+    return normalized == 90 or normalized == 270;
 }
 
 fn parseRate(text: []const u8, probe: *VideoProbe) void {
@@ -690,29 +710,20 @@ fn evenAtLeast2(value: u32) u32 {
 fn extractBaseRaw(input: []const u8, temp_raw: []const u8, width: u32, height: u32, fps_num: u32, fps_den: u32, frame_limit: u32) !void {
     const scale = try std.fmt.allocPrint(allocator, "scale={d}:{d}:flags=bicubic,fps={d}/{d}", .{ width, height, fps_num, fps_den });
     defer allocator.free(scale);
-    const frames = try std.fmt.allocPrint(allocator, "{d}", .{frame_limit});
-    defer allocator.free(frames);
 
-    const argv = [_][]const u8{
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        input,
-        "-an",
-        "-vf",
-        scale,
-        "-frames:v",
-        frames,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "yuv420p",
-        temp_raw,
-    };
-    const out = try runChecked(&argv, 1024 * 1024);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &[_][]const u8{
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", input, "-an", "-vf", scale,
+    });
+    var frames: ?[]u8 = null;
+    defer if (frames) |value| allocator.free(value);
+    if (frame_limit > 0) {
+        frames = try std.fmt.allocPrint(allocator, "{d}", .{frame_limit});
+        try argv.appendSlice(allocator, &[_][]const u8{ "-frames:v", frames.? });
+    }
+    try argv.appendSlice(allocator, &[_][]const u8{ "-f", "rawvideo", "-pix_fmt", "yuv420p", temp_raw });
+    const out = try runChecked(argv.items, 1024 * 1024);
     allocator.free(out);
 }
 
@@ -2486,6 +2497,21 @@ test "rle roundtrip" {
 
 test "crc32 known vector" {
     try std.testing.expectEqual(@as(u32, 0xcbf43926), crc32("123456789"));
+}
+
+test "frame limit parser supports full encode" {
+    try std.testing.expectEqual(@as(u32, 0), try parseFrameLimit("all"));
+    try std.testing.expectEqual(@as(u32, 0), try parseFrameLimit("full"));
+    try std.testing.expectEqual(@as(u32, 0), try parseFrameLimit("0"));
+    try std.testing.expectEqual(@as(u32, 120), try parseFrameLimit("120"));
+}
+
+test "quarter-turn rotation detection" {
+    try std.testing.expect(isQuarterTurn(90));
+    try std.testing.expect(isQuarterTurn(-90));
+    try std.testing.expect(isQuarterTurn(270));
+    try std.testing.expect(!isQuarterTurn(0));
+    try std.testing.expect(!isQuarterTurn(180));
 }
 
 test "entropy coder roundtrip" {

@@ -170,6 +170,7 @@ const encodeFile = document.querySelector<HTMLInputElement>("#encodeFile");
 const encodeFileName = document.querySelector<HTMLElement>("#encodeFileName");
 const encodeProfile = document.querySelector<HTMLSelectElement>("#encodeProfile");
 const encodeFrames = document.querySelector<HTMLInputElement>("#encodeFrames");
+const profileNote = document.querySelector<HTMLElement>("#profileNote");
 const encodeSubmit = document.querySelector<HTMLButtonElement>("#encodeSubmit");
 const encodeStatus = document.querySelector<HTMLElement>("#encodeStatus");
 const decodeForm = document.querySelector<HTMLFormElement>("#decodeForm");
@@ -195,6 +196,7 @@ if (
   !encodeFileName ||
   !encodeProfile ||
   !encodeFrames ||
+  !profileNote ||
   !encodeSubmit ||
   !encodeStatus ||
   !decodeForm ||
@@ -215,6 +217,7 @@ webgpu.textContent =
   "gpu" in navigator
     ? "WebGPU API detected. Neural mode reconstructs from codec base packets first, then CPU fallback."
     : "WebGPU API not detected. CPU MOD0 neural reconstruction is active.";
+updateProfileNote();
 
 player.addEventListener("ready", (event) => {
   const parsed = (event as CustomEvent<NvcFile>).detail;
@@ -394,6 +397,8 @@ encodeFile.addEventListener("change", () => {
   setStatus(encodeStatus, file ? `${formatBytes(file.size)} selected` : "Idle");
 });
 
+encodeProfile.addEventListener("change", updateProfileNote);
+
 decodeFile.addEventListener("change", () => {
   const file = decodeFile.files?.[0];
   decodeFileName.textContent = file ? file.name : "Choose NVC file";
@@ -413,7 +418,7 @@ encodeForm.addEventListener("submit", async (event) => {
     const form = new FormData();
     form.append("source", file);
     form.append("profile", encodeProfile.value);
-    form.append("frames", encodeFrames.value);
+    form.append("frames", encodeFrames.value.trim());
     const result = await postFileJob("/api/encode", form);
     downloadBlob(result.blob, result.filename);
     setStatus(encodeStatus, `Created ${result.filename} (${formatBytes(result.blob.size)})`);
@@ -488,6 +493,13 @@ function downloadBlob(blob: Blob, filename: string): void {
 function setStatus(node: HTMLElement, message: string, error = false): void {
   node.textContent = message;
   node.classList.toggle("error", error);
+}
+
+function updateProfileNote(): void {
+  const isXc = encodeProfile.value === "xc";
+  profileNote.innerHTML = isXc
+    ? "<strong>NVC-XC</strong><span>Maximum compression. Uses a smaller base stream, slower encode, and more neural reconstruction.</span>"
+    : "<strong>NVC-W1</strong><span>Realtime web playback target. Uses a larger base stream, faster decode, and usually bigger files.</span>";
 }
 
 function formatTime(seconds: number, preview: PreviewInfo | null): string {

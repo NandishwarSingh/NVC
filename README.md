@@ -97,6 +97,8 @@ Encode it to NVC:
 ./zig-out/bin/nvc encode samples/input.mp4 samples/output.nvc --profile w1 --model ml/exports/nvc-tinysr-v0.modl
 ```
 
+By default, `nvc encode` encodes the full input video. Use `--frames 60` only when you want a short test encode.
+
 Inspect the file:
 
 ```bash
@@ -120,7 +122,7 @@ bun run dev
 
 Open the URL printed by Bun. The web app can:
 
-- Upload a normal video and download a `.nvc` file.
+- Upload a normal video and download a `.nvc` file. The web app defaults to `NVC-XC`; leave frame limit blank to encode the full video.
 - Upload a `.nvc` file and download a decoded MP4.
 - Upload or drag a `.nvc` file and play it directly in Preview, Codec, or Neural mode.
 
@@ -174,7 +176,7 @@ Use this for smaller files when slower encoding is okay.
 ./zig-out/bin/nvc encode input.mp4 output.nvc --profile xc
 ```
 
-The alpha XC encoder uses a quarter-resolution base stream. Future XC builds will add stronger neural and feature-level compression.
+The alpha XC encoder uses a quarter-resolution base stream. A 1920x1080 video becomes a 480x270 base stream. Future XC builds will add stronger neural and feature-level compression.
 
 ## Project Structure
 

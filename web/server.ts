@@ -123,10 +123,13 @@ async function handleEncode(req: Request): Promise<Response> {
   const form = await req.formData();
   const source = form.get("source");
   if (!(source instanceof File)) return json({ error: "Upload a source video." }, 400);
-  const profileValue = String(form.get("profile") ?? "w1");
+  const profileValue = String(form.get("profile") ?? "xc");
   const profile = profileValue === "xc" ? "xc" : "w1";
-  const frameText = String(form.get("frames") ?? "60");
-  const frames = Math.max(1, Math.min(900, Number.parseInt(frameText, 10) || 60));
+  const frameText = String(form.get("frames") ?? "").trim().toLowerCase();
+  const frameLimit =
+    frameText.length === 0 || frameText === "all" || frameText === "full"
+      ? null
+      : Math.max(1, Math.min(20000, Number.parseInt(frameText, 10) || 0));
   const workDir = join(tmpdir(), `nvc-web-encode-${crypto.randomUUID()}`);
   await mkdir(workDir, { recursive: true });
   try {
@@ -135,7 +138,9 @@ async function handleEncode(req: Request): Promise<Response> {
     const outputName = `${stem}-${profile}.nvc`;
     const outputPath = join(workDir, outputName);
     await Bun.write(inputPath, source);
-    await runNvc([nvcBin, "encode", inputPath, outputPath, "--profile", profile, "--frames", String(frames), "--model", defaultModel]);
+    const args = [nvcBin, "encode", inputPath, outputPath, "--profile", profile, "--model", defaultModel];
+    if (frameLimit !== null) args.push("--frames", String(frameLimit));
+    await runNvc(args);
     return await commandFileResponse(outputPath, outputName, "application/octet-stream");
   } finally {
     await rm(workDir, { recursive: true, force: true });

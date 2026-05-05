@@ -39,13 +39,17 @@
                 <span>Profile</span>
                 <select id="encodeProfile" name="profile">
                   <option value="w1">NVC-W1</option>
-                  <option value="xc">NVC-XC</option>
+                  <option value="xc" selected>NVC-XC</option>
                 </select>
               </label>
               <label>
-                <span>Frames</span>
-                <input id="encodeFrames" name="frames" type="number" min="1" max="900" value="60" />
+                <span>Frame limit</span>
+                <input id="encodeFrames" name="frames" type="text" inputmode="numeric" placeholder="All" />
               </label>
+            </div>
+            <div class="profile-note" id="profileNote">
+              <strong>NVC-XC</strong>
+              <span>Maximum compression. Uses a smaller base stream, slower encode, and more neural reconstruction.</span>
             </div>
             <button id="encodeSubmit" class="primary-action" type="submit">Encode and download</button>
             <p id="encodeStatus" class="status-line">Idle</p>

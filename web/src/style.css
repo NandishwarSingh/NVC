@@ -257,7 +257,8 @@ h1 {
 }
 
 select,
-input[type="number"] {
+input[type="number"],
+input[type="text"] {
   width: 100%;
   height: 38px;
   border: 1px solid var(--line);
@@ -265,6 +266,25 @@ input[type="number"] {
   color: var(--text);
   background: #0f0f0d;
   padding: 0 10px;
+}
+
+.profile-note {
+  display: grid;
+  gap: 4px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f0f0d;
+}
+
+.profile-note strong {
+  font-size: 13px;
+}
+
+.profile-note span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .primary-action,
