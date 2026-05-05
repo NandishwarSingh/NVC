@@ -17,6 +17,8 @@ export class NVCPlayer extends EventTarget {
   private frameIndex = 0;
   private playing = false;
   private timer: number | null = null;
+  private frameDisplaySize: { width: number; height: number } | null = null;
+  private readonly handleResize = () => this.resizeCanvasDisplay();
 
   constructor(options: PlayerOptions) {
     super();
@@ -25,6 +27,7 @@ export class NVCPlayer extends EventTarget {
     const ctx = this.canvas.getContext("2d");
     if (!ctx) throw new Error("Canvas 2D is unavailable");
     this.ctx = ctx;
+    window.addEventListener("resize", this.handleResize);
   }
 
   async loadFile(file: File): Promise<void> {
@@ -78,6 +81,8 @@ export class NVCPlayer extends EventTarget {
     const firstFrame = neural ? neural.imageData : this.renderMode === "codec" ? decodeCodecBaseFrame(this.parsed, this.frameIndex) : decodeBaseFrame(this.parsed, this.frameIndex);
     this.canvas.width = firstFrame.width;
     this.canvas.height = firstFrame.height;
+    this.frameDisplaySize = { width: firstFrame.width, height: firstFrame.height };
+    this.resizeCanvasDisplay();
     this.ctx.putImageData(firstFrame, 0, 0);
     this.dispatchEvent(
       new CustomEvent("frame", {
@@ -114,6 +119,23 @@ export class NVCPlayer extends EventTarget {
 
   destroy(): void {
     this.pause();
+    window.removeEventListener("resize", this.handleResize);
+  }
+
+  private resizeCanvasDisplay(): void {
+    const size = this.frameDisplaySize ?? { width: this.canvas.width, height: this.canvas.height };
+    if (size.width <= 0 || size.height <= 0) return;
+    const wrap = this.canvas.parentElement;
+    const wrapStyle = wrap ? window.getComputedStyle(wrap) : null;
+    const paddingX = wrapStyle ? parseFloat(wrapStyle.paddingLeft) + parseFloat(wrapStyle.paddingRight) : 0;
+    const availableWidth = Math.max(180, (wrap?.clientWidth ?? 1120) - paddingX);
+    const availableHeight = Math.max(240, Math.min(760, Math.floor(window.innerHeight * 0.64)));
+    const scale = Math.min(availableWidth / size.width, availableHeight / size.height);
+    const displayWidth = Math.max(1, Math.round(size.width * scale));
+    const displayHeight = Math.max(1, Math.round(size.height * scale));
+    this.canvas.style.width = `${displayWidth}px`;
+    this.canvas.style.height = `${displayHeight}px`;
+    this.canvas.style.aspectRatio = `${size.width} / ${size.height}`;
   }
 
   private scheduleNextFrame(): void {

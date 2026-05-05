@@ -374,18 +374,20 @@ input[type="text"] {
   position: relative;
   min-height: 320px;
   padding: 14px;
+  display: grid;
+  place-items: center;
   background: #080807;
 }
 
 canvas {
   display: block;
-  width: min(100%, 1120px);
-  aspect-ratio: 16 / 9;
+  max-width: 100%;
   height: auto;
   margin: 0 auto;
   border: 1px solid #201f1b;
   border-radius: 8px;
   background: #020202;
+  object-fit: contain;
 }
 
 .dropzone {
