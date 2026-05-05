@@ -57,8 +57,8 @@
               <label>
                 <span>Profile</span>
                 <select id="encodeProfile" name="profile">
-                  <option value="w1">NVC-W1</option>
-                  <option value="xc" selected>NVC-XC</option>
+                  <option value="w1" selected>NVC-W1</option>
+                  <option value="xc">NVC-XC</option>
                 </select>
               </label>
               <label>
@@ -67,8 +67,8 @@
               </label>
             </div>
             <div class="profile-note" id="profileNote">
-              <strong>NVC-XC</strong>
-              <span>Maximum compression. Uses a very small base stream, 12 fps cap, heavier quantization, and more neural reconstruction.</span>
+              <strong>NVC-W1</strong>
+              <span>Realtime web playback. Half-resolution VP9 base, 30 fps cap, neural reconstruction in the browser.</span>
             </div>
             <button id="encodeSubmit" class="primary-action" type="submit">Encode and download</button>
             <p id="encodeStatus" class="status-line">Idle</p>
@@ -120,9 +120,9 @@
                 <strong>NVC canvas</strong>
               </div>
               <div class="segmented" aria-label="Render mode">
-                <button type="button" class="active" data-mode="preview">Preview</button>
+                <button type="button" data-mode="preview">Preview</button>
                 <button type="button" data-mode="codec">Codec</button>
-                <button type="button" data-mode="neural">Neural</button>
+                <button type="button" class="active" data-mode="neural">Neural</button>
               </div>
             </div>
 

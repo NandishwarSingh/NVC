@@ -11,13 +11,23 @@ export class NVCPlayer extends EventTarget {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private parsed: NvcFile | null = null;
-  private renderMode: RenderMode = "preview";
+  // Default mode is Neural — matches the UI's default-active segmented button and
+  // gives the highest-quality first frame. While the user presses Play we transparently
+  // render in Codec mode (BAS6 cache lookup, ~1ms) so the video animates at native fps;
+  // returning to paused state re-renders in renderMode (Neural) for the still-frame view.
+  private renderMode: RenderMode = "neural";
+  // The mode used while `playing` is true. Always "codec" because per-frame Neural SR
+  // (ORT-Web run on WebGPU + composite) costs ~100ms+ which can't sustain 30 fps.
+  private readonly playbackMode: RenderMode = "codec";
   private preferWebGPU: boolean;
   private preview: PreviewInfo | null = null;
   private frameIndex = 0;
   private playing = false;
   private timer: number | null = null;
   private frameDisplaySize: { width: number; height: number } | null = null;
+  private basePrep: Promise<void> | null = null;
+  private neuralFrameCache: Map<number, ImageData> = new Map();
+  private codecFrameCache: Map<number, ImageData> = new Map();
   // True when the loaded file is XC profile. We keep parser + decoders intact (they still
   // run for the Decode tool's server-side path), but we skip in-browser playback because
   // TinySR x2 can't recover a 4× ratio cleanly. UI shows an info panel instead.
@@ -36,6 +46,7 @@ export class NVCPlayer extends EventTarget {
   }
 
   async loadFile(file: File): Promise<void> {
+    this.resetCaches();
     const buffer = await file.arrayBuffer();
     this.parsed = parseNvc(buffer);
     this.preview = getPreviewInfo(this.parsed);
@@ -50,10 +61,12 @@ export class NVCPlayer extends EventTarget {
     });
     this.dispatchEvent(new CustomEvent("ready", { detail: this.parsed }));
     if (this.isXc) return; // skip canvas; UI shows info panel instead
+    await this.warmBaseCache();
     await this.renderFrame(0);
   }
 
   async loadUrl(url: string): Promise<void> {
+    this.resetCaches();
     const result = await loadNvcUrl(url);
     this.emitStats(result.stats);
     this.parsed = result.file;
@@ -64,7 +77,26 @@ export class NVCPlayer extends EventTarget {
     this.detectProfile(result.stats.fileBytes ?? 0);
     this.dispatchEvent(new CustomEvent("ready", { detail: this.parsed }));
     if (this.isXc) return;
+    await this.warmBaseCache();
     await this.renderFrame(0);
+  }
+
+  private resetCaches(): void {
+    this.basePrep = null;
+    this.neuralFrameCache.clear();
+    this.codecFrameCache.clear();
+  }
+
+  // Warm the BAS6/VP9 frame cache before the first render so Codec/Neural mode never
+  // hits "cache not ready" the moment the user clicks Play. Stores the in-flight promise
+  // so concurrent renderFrame calls all await the same warmup.
+  private async warmBaseCache(): Promise<void> {
+    if (!this.parsed) return;
+    if (!this.basePrep) {
+      this.dispatchEvent(new CustomEvent("buffering", { detail: { mode: "codec" } }));
+      this.basePrep = prepareBaseDecode(this.parsed).catch(() => undefined);
+    }
+    return this.basePrep;
   }
 
   isXcProfile(): boolean {
@@ -126,10 +158,48 @@ export class NVCPlayer extends EventTarget {
     if (!this.parsed) return;
     const maxIndex = this.preview ? this.preview.frameCount - 1 : 0;
     this.frameIndex = Math.max(0, Math.min(maxIndex, index));
-    this.dispatchEvent(new CustomEvent("buffering", { detail: { mode: this.renderMode } }));
-    if (this.renderMode === "codec" || this.renderMode === "neural") await this.ensureBasePacket(this.frameIndex);
-    const neural = this.renderMode === "neural" ? await this.runNeural() : null;
-    const firstFrame = neural ? neural.imageData : this.renderMode === "codec" ? decodeCodecBaseFrame(this.parsed, this.frameIndex) : decodeBaseFrame(this.parsed, this.frameIndex);
+
+    // Effective mode: while playing, force Codec (fast cache lookup, sustains native fps);
+    // while paused/seeking, honour the user's chosen renderMode (Neural by default).
+    const effective: RenderMode = this.playing ? this.playbackMode : this.renderMode;
+
+    this.dispatchEvent(new CustomEvent("buffering", { detail: { mode: effective } }));
+    if (effective === "codec" || effective === "neural") await this.warmBaseCache();
+
+    let firstFrame: ImageData;
+    let backend = "preview";
+    let fallbackReason: string | undefined;
+
+    if (effective === "neural") {
+      const cached = this.neuralFrameCache.get(this.frameIndex);
+      if (cached) {
+        firstFrame = cached;
+        backend = "neural-cache";
+      } else {
+        const neural = await this.runNeural();
+        firstFrame = neural.imageData;
+        backend = neural.backend;
+        fallbackReason = neural.fallbackReason;
+        // Cache only the still-frame Neural output (saves the 100ms+ ORT round-trip on re-seek).
+        // Limit cache size so very long clips don't blow up memory.
+        if (this.neuralFrameCache.size < 240) this.neuralFrameCache.set(this.frameIndex, firstFrame);
+      }
+    } else if (effective === "codec") {
+      const cached = this.codecFrameCache.get(this.frameIndex);
+      if (cached) {
+        firstFrame = cached;
+        backend = "codec-cache";
+      } else {
+        firstFrame = decodeCodecBaseFrame(this.parsed, this.frameIndex);
+        backend = "native-base";
+        // Codec frames are decoded in O(1) from the BAS6 cache, but the RGB→ImageData
+        // conversion still costs a few ms; caching makes Play smooth.
+        if (this.codecFrameCache.size < 600) this.codecFrameCache.set(this.frameIndex, firstFrame);
+      }
+    } else {
+      firstFrame = decodeBaseFrame(this.parsed, this.frameIndex);
+    }
+
     this.canvas.width = firstFrame.width;
     this.canvas.height = firstFrame.height;
     this.frameDisplaySize = { width: firstFrame.width, height: firstFrame.height };
@@ -139,11 +209,11 @@ export class NVCPlayer extends EventTarget {
       new CustomEvent("frame", {
         detail: {
           index: this.frameIndex,
-          mode: this.renderMode,
+          mode: effective,
           width: firstFrame.width,
           height: firstFrame.height,
-          backend: neural?.backend ?? (this.renderMode === "codec" ? "native-base" : "preview"),
-          fallbackReason: neural?.fallbackReason,
+          backend,
+          fallbackReason,
           seconds: this.preview ? this.frameIndex / previewFps(this.preview) : 0,
           frameCount: this.preview?.frameCount ?? 1,
           fps: this.preview ? previewFps(this.preview) : 1,
@@ -157,7 +227,13 @@ export class NVCPlayer extends EventTarget {
     if (!this.preview || this.preview.frameCount <= 1 || this.playing) return;
     this.playing = true;
     this.dispatchEvent(new Event("play"));
-    this.scheduleNextFrame();
+    // Make sure the codec cache is warmed before the first scheduled tick fires —
+    // otherwise the user sees Play do "nothing" for a few seconds while VP9 decodes.
+    this.warmBaseCache().then(() => {
+      // Re-render the current frame in playbackMode so the user sees the codec image
+      // immediately, then start ticking.
+      this.renderFrame(this.frameIndex).then(() => this.scheduleNextFrame());
+    });
   }
 
   pause(): void {
@@ -237,6 +313,7 @@ export class NVCPlayer extends EventTarget {
     }
   }
 
+  // Legacy ensureBasePacket kept for BAS5 fallback files; BAS6 path uses warmBaseCache.
   private async ensureBasePacket(frameIndex: number): Promise<void> {
     if (!this.parsed) return;
     const stats = await ensureNvcBasePacket(this.parsed, frameIndex);
