@@ -160,17 +160,56 @@ const metadata = document.querySelector<HTMLElement>("#metadata");
 const log = document.querySelector<HTMLElement>("#log");
 const webgpu = document.querySelector<HTMLElement>("#webgpu");
 const loadSample = document.querySelector<HTMLButtonElement>("#loadSample");
+const playFile = document.querySelector<HTMLInputElement>("#playFile");
 const playPause = document.querySelector<HTMLButtonElement>("#playPause");
 const seek = document.querySelector<HTMLInputElement>("#seek");
 const timecode = document.querySelector<HTMLElement>("#timecode");
 const modeButtons = document.querySelectorAll<HTMLButtonElement>("[data-mode]");
+const encodeForm = document.querySelector<HTMLFormElement>("#encodeForm");
+const encodeFile = document.querySelector<HTMLInputElement>("#encodeFile");
+const encodeFileName = document.querySelector<HTMLElement>("#encodeFileName");
+const encodeProfile = document.querySelector<HTMLSelectElement>("#encodeProfile");
+const encodeFrames = document.querySelector<HTMLInputElement>("#encodeFrames");
+const encodeSubmit = document.querySelector<HTMLButtonElement>("#encodeSubmit");
+const encodeStatus = document.querySelector<HTMLElement>("#encodeStatus");
+const decodeForm = document.querySelector<HTMLFormElement>("#decodeForm");
+const decodeFile = document.querySelector<HTMLInputElement>("#decodeFile");
+const decodeFileName = document.querySelector<HTMLElement>("#decodeFileName");
+const decodeSubmit = document.querySelector<HTMLButtonElement>("#decodeSubmit");
+const decodeStatus = document.querySelector<HTMLElement>("#decodeStatus");
+const decodedVideo = document.querySelector<HTMLVideoElement>("#decodedVideo");
 
-if (!canvas || !dropzone || !metadata || !log || !webgpu || !loadSample || !playPause || !seek || !timecode) {
+if (
+  !canvas ||
+  !dropzone ||
+  !metadata ||
+  !log ||
+  !webgpu ||
+  !loadSample ||
+  !playFile ||
+  !playPause ||
+  !seek ||
+  !timecode ||
+  !encodeForm ||
+  !encodeFile ||
+  !encodeFileName ||
+  !encodeProfile ||
+  !encodeFrames ||
+  !encodeSubmit ||
+  !encodeStatus ||
+  !decodeForm ||
+  !decodeFile ||
+  !decodeFileName ||
+  !decodeSubmit ||
+  !decodeStatus ||
+  !decodedVideo
+) {
   throw new Error("Missing required DOM nodes");
 }
 
 const player = new NVCPlayer({ canvas, preferWebGPU: true });
 let lastLoadStats: NvcLoadStats | null = null;
+let decodedVideoUrl: string | null = null;
 
 webgpu.textContent =
   "gpu" in navigator
@@ -337,6 +376,119 @@ loadSample.addEventListener("click", async () => {
     log.textContent = error instanceof Error ? error.message : String(error);
   }
 });
+
+playFile.addEventListener("change", async () => {
+  const file = playFile.files?.[0];
+  if (!file) return;
+  try {
+    log.textContent = `Loading ${file.name}...`;
+    await player.loadFile(file);
+  } catch (error) {
+    log.textContent = error instanceof Error ? error.message : String(error);
+  }
+});
+
+encodeFile.addEventListener("change", () => {
+  const file = encodeFile.files?.[0];
+  encodeFileName.textContent = file ? file.name : "Choose source video";
+  setStatus(encodeStatus, file ? `${formatBytes(file.size)} selected` : "Idle");
+});
+
+decodeFile.addEventListener("change", () => {
+  const file = decodeFile.files?.[0];
+  decodeFileName.textContent = file ? file.name : "Choose NVC file";
+  setStatus(decodeStatus, file ? `${formatBytes(file.size)} selected` : "Idle");
+});
+
+encodeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const file = encodeFile.files?.[0];
+  if (!file) {
+    setStatus(encodeStatus, "Choose a source video first.", true);
+    return;
+  }
+  encodeSubmit.disabled = true;
+  setStatus(encodeStatus, `Encoding ${file.name}...`);
+  try {
+    const form = new FormData();
+    form.append("source", file);
+    form.append("profile", encodeProfile.value);
+    form.append("frames", encodeFrames.value);
+    const result = await postFileJob("/api/encode", form);
+    downloadBlob(result.blob, result.filename);
+    setStatus(encodeStatus, `Created ${result.filename} (${formatBytes(result.blob.size)})`);
+    const nvcFile = new File([result.blob], result.filename, { type: "application/octet-stream" });
+    await player.loadFile(nvcFile);
+  } catch (error) {
+    setStatus(encodeStatus, error instanceof Error ? error.message : String(error), true);
+  } finally {
+    encodeSubmit.disabled = false;
+  }
+});
+
+decodeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const file = decodeFile.files?.[0];
+  if (!file) {
+    setStatus(decodeStatus, "Choose an NVC file first.", true);
+    return;
+  }
+  decodeSubmit.disabled = true;
+  setStatus(decodeStatus, `Decoding ${file.name}...`);
+  try {
+    const form = new FormData();
+    form.append("source", file);
+    const result = await postFileJob("/api/decode", form);
+    downloadBlob(result.blob, result.filename);
+    if (decodedVideoUrl) URL.revokeObjectURL(decodedVideoUrl);
+    decodedVideoUrl = URL.createObjectURL(result.blob);
+    decodedVideo.src = decodedVideoUrl;
+    decodedVideo.hidden = false;
+    setStatus(decodeStatus, `Created ${result.filename} (${formatBytes(result.blob.size)})`);
+    await player.loadFile(file);
+  } catch (error) {
+    setStatus(decodeStatus, error instanceof Error ? error.message : String(error), true);
+  } finally {
+    decodeSubmit.disabled = false;
+  }
+});
+
+async function postFileJob(endpoint: string, form: FormData): Promise<{ blob: Blob; filename: string }> {
+  const response = await fetch(endpoint, { method: "POST", body: form });
+  if (!response.ok) {
+    const message = await response
+      .json()
+      .then((payload) => String(payload.error ?? response.statusText))
+      .catch(() => response.statusText);
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  return {
+    blob,
+    filename: filenameFromDisposition(response.headers.get("content-disposition")) ?? (endpoint.includes("encode") ? "output.nvc" : "decoded.mp4"),
+  };
+}
+
+function filenameFromDisposition(value: string | null): string | null {
+  const match = value?.match(/filename="([^"]+)"/);
+  return match?.[1] ?? null;
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function setStatus(node: HTMLElement, message: string, error = false): void {
+  node.textContent = message;
+  node.classList.toggle("error", error);
+}
 
 function formatTime(seconds: number, preview: PreviewInfo | null): string {
   const duration = preview ? preview.frameCount / previewFps(preview) : 0;

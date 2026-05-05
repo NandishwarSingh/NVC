@@ -3,34 +3,126 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>NVC Web Player</title>
+    <title>NVC Studio</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="player">
-        <canvas id="preview" width="960" height="540"></canvas>
-        <div id="dropzone" class="dropzone">
-          <strong>Drop a .nvc file here</strong>
-          <button id="loadSample" type="button">Sample</button>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="codec-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <p class="eyebrow">Neural Video Codec</p>
+            <h1>NVC Studio</h1>
+          </div>
         </div>
+        <div class="runtime-pill">
+          <span class="signal"></span>
+          <span id="webgpu">Checking WebGPU</span>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <aside class="tool-rail" aria-label="Codec tools">
+          <form id="encodeForm" class="tool-card">
+            <div class="card-head">
+              <span class="step">Encode</span>
+              <strong>Video to .nvc</strong>
+            </div>
+            <label class="drop-input">
+              <input id="encodeFile" name="source" type="file" accept="video/*" />
+              <span class="file-title" id="encodeFileName">Choose source video</span>
+              <span class="file-meta">MP4, MOV, MKV, WebM</span>
+            </label>
+            <div class="control-grid">
+              <label>
+                <span>Profile</span>
+                <select id="encodeProfile" name="profile">
+                  <option value="w1">NVC-W1</option>
+                  <option value="xc">NVC-XC</option>
+                </select>
+              </label>
+              <label>
+                <span>Frames</span>
+                <input id="encodeFrames" name="frames" type="number" min="1" max="900" value="60" />
+              </label>
+            </div>
+            <button id="encodeSubmit" class="primary-action" type="submit">Encode and download</button>
+            <p id="encodeStatus" class="status-line">Idle</p>
+          </form>
+
+          <form id="decodeForm" class="tool-card">
+            <div class="card-head">
+              <span class="step">Decode</span>
+              <strong>.nvc to MP4</strong>
+            </div>
+            <label class="drop-input">
+              <input id="decodeFile" name="source" type="file" accept=".nvc,application/octet-stream" />
+              <span class="file-title" id="decodeFileName">Choose NVC file</span>
+              <span class="file-meta">Returns a playable MP4</span>
+            </label>
+            <button id="decodeSubmit" class="secondary-action" type="submit">Decode and download</button>
+            <p id="decodeStatus" class="status-line">Idle</p>
+            <video id="decodedVideo" class="decoded-video" controls hidden></video>
+          </form>
+        </aside>
+
+        <section class="stage">
+          <div class="stage-card">
+            <div class="stage-toolbar">
+              <div>
+                <p class="eyebrow">Playback</p>
+                <strong>NVC canvas</strong>
+              </div>
+              <div class="segmented" aria-label="Render mode">
+                <button type="button" class="active" data-mode="preview">Preview</button>
+                <button type="button" data-mode="codec">Codec</button>
+                <button type="button" data-mode="neural">Neural</button>
+              </div>
+            </div>
+
+            <div class="canvas-wrap">
+              <canvas id="preview" width="960" height="540"></canvas>
+              <div id="dropzone" class="dropzone">
+                <div>
+                  <strong>Drop .nvc to play</strong>
+                  <span>or choose a file below</span>
+                </div>
+                <div class="drop-actions">
+                  <label class="ghost-action">
+                    <input id="playFile" type="file" accept=".nvc,application/octet-stream" />
+                    Choose .nvc
+                  </label>
+                  <button id="loadSample" type="button">Sample</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="transport">
+              <button id="playPause" type="button">Play</button>
+              <input id="seek" type="range" min="0" max="0" value="0" step="1" />
+              <span id="timecode">0:00 / 0:00</span>
+            </div>
+          </div>
+
+          <div class="info-grid">
+            <section class="info-panel">
+              <div class="panel-title">
+                <span class="step">File</span>
+                <strong>Metadata</strong>
+              </div>
+              <dl id="metadata"></dl>
+            </section>
+            <section class="info-panel">
+              <div class="panel-title">
+                <span class="step">Runtime</span>
+                <strong>Events</strong>
+              </div>
+              <pre id="log">Waiting for a file.</pre>
+            </section>
+          </div>
+        </section>
       </section>
-      <aside class="panel">
-        <h1>NVC Player</h1>
-        <p id="webgpu">Checking WebGPU...</p>
-        <div class="segmented" aria-label="Render mode">
-          <button type="button" class="active" data-mode="preview">Preview</button>
-          <button type="button" data-mode="codec">Codec</button>
-          <button type="button" data-mode="neural">Neural</button>
-        </div>
-        <div class="transport">
-          <button id="playPause" type="button">Play</button>
-          <input id="seek" type="range" min="0" max="0" value="0" step="1" />
-          <span id="timecode">0:00 / 0:00</span>
-        </div>
-        <dl id="metadata"></dl>
-        <pre id="log">Waiting for a file.</pre>
-      </aside>
     </main>
     <script type="module" src="/bundle.js"></script>
   </body>

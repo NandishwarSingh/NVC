@@ -38,7 +38,7 @@ Current alpha status:
 - `nvc decode`: working for alpha preview video output.
 - `nvc info`: working.
 - `nvc inspect`: working.
-- Browser `.nvc` parser/player demo: working for metadata, chunk info, drag-and-drop, range-loaded sample playback, playable `PRVW` preview streams with play/pause/seek, BAS5 packet-index loading, GOP packet range fetches, packet byte cache, decoded GOP frame cache for Codec/Neural seek, alpha Codec playback across GOP packet boundaries, codec-base detail guidance, `FET1` feature residuals, `COL1`/`GRN1` reconstruction tuning in Neural mode, legacy color first-frame `BAS0`/`BAS1`/`BAS2`/`BAS3`/`BAS4` preview, and `MOD0` TinySR neural reconstruction through WebGPU with CPU fallback.
+- Browser NVC Studio app: working for normal video upload to downloadable `.nvc`, `.nvc` upload to downloadable MP4, local `.nvc` playback, metadata, chunk info, drag-and-drop, range-loaded sample playback, playable `PRVW` preview streams with play/pause/seek, BAS5 packet-index loading, GOP packet range fetches, packet byte cache, decoded GOP frame cache for Codec/Neural seek, alpha Codec playback across GOP packet boundaries, codec-base detail guidance, `FET1` feature residuals, `COL1`/`GRN1` reconstruction tuning in Neural mode, legacy color first-frame `BAS0`/`BAS1`/`BAS2`/`BAS3`/`BAS4` preview, and `MOD0` TinySR neural reconstruction through WebGPU with CPU fallback.
 - `NVC-TinySR-v0` model export: working as a self-contained `MOD0` artifact.
 - Optional PyTorch training path: working from normal source videos or paired `.pt` tensors.
 - Feature residuals: working as compact alpha `FET1` luma correction vectors inside `FEAT`.
@@ -110,7 +110,7 @@ Decode it back to a normal video:
 ./zig-out/bin/nvc decode samples/output.nvc samples/reconstructed.mp4
 ```
 
-Run the browser demo:
+Run NVC Studio:
 
 ```bash
 cd web
@@ -118,7 +118,13 @@ bun install
 bun run dev
 ```
 
-Open the URL printed by Bun, then drag `samples/output.nvc` into the page.
+Open the URL printed by Bun. The web app can:
+
+- Upload a normal video and download a `.nvc` file.
+- Upload a `.nvc` file and download a decoded MP4.
+- Upload or drag a `.nvc` file and play it directly in Preview, Codec, or Neural mode.
+
+The interface follows the ElevenLabs UI style of code-owned, shadcn-like primitives: restrained cards, compact controls, status surfaces, and editable local components.
 
 Set up Python tooling:
 
@@ -174,7 +180,7 @@ The alpha XC encoder uses a quarter-resolution base stream. Future XC builds wil
 
 ```text
 core/    Zig codec library and CLI
-web/     Bun + TypeScript browser player
+web/     Bun + TypeScript NVC Studio web app and browser player
 ml/      Python model training and benchmark tools
 spec/    NVC file format and profile docs
 samples/ sample files and fixtures
@@ -193,7 +199,7 @@ The final NVC playback pipeline is:
 7. Add synthetic grain using `GRAN`.
 8. Draw the final frame to a canvas.
 
-The alpha browser player parses the `.nvc` file and uses `PVW1` data inside `PRVW` for instant preview playback with play, pause, and seek controls. URL playback uses HTTP Range requests to load the header, `TOC0`, `PRVW`, `MODL`, `SEEK`, `FEAT`, `COLR`, `GRAN`, and the small BAS5 packet index first instead of downloading the whole file before the first frame. Codec and Neural modes then range-load only the BAS5 GOP packet needed for the current seek position. Neural mode runs TinySR, guides luma/detail from the decoded codec base so it does not throw away BAS5 detail, then applies `FET1` luma feature residuals, `COL1` color tuning, and `GRN1` deterministic grain. It still supports direct color first-frame decode for older `BAS0`, `BAS1`, `BAS2`, `BAS3`, and `BAS4` files that do not have `PRVW`, plus older still-frame `PVW0` files. It can run the embedded `MOD0` TinySR model through WebGPU, with a smaller CPU fallback if WebGPU is unavailable or too slow.
+NVC Studio adds browser upload/download workflows on top of the player. The Bun server accepts video uploads at `/api/encode`, calls the Zig CLI, and returns a `.nvc` download. It accepts `.nvc` uploads at `/api/decode`, calls the Zig decoder, and returns a decoded MP4 download. The playback surface parses `.nvc` files in the browser and uses `PVW1` data inside `PRVW` for instant preview playback with play, pause, and seek controls. URL playback uses HTTP Range requests to load the header, `TOC0`, `PRVW`, `MODL`, `SEEK`, `FEAT`, `COLR`, `GRAN`, and the small BAS5 packet index first instead of downloading the whole file before the first frame. Codec and Neural modes then range-load only the BAS5 GOP packet needed for the current seek position. Neural mode runs TinySR, guides luma/detail from the decoded codec base so it does not throw away BAS5 detail, then applies `FET1` luma feature residuals, `COL1` color tuning, and `GRN1` deterministic grain. It still supports direct color first-frame decode for older `BAS0`, `BAS1`, `BAS2`, `BAS3`, and `BAS4` files that do not have `PRVW`, plus older still-frame `PVW0` files. It can run the embedded `MOD0` TinySR model through WebGPU, with a smaller CPU fallback if WebGPU is unavailable or too slow.
 
 ## How Compression Works
 
