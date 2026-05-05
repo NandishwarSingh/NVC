@@ -75,7 +75,25 @@ The first model is `NVC-TinySR-v0`, a small x2 CNN with two ReLU convolution lay
 
 `PRVW` is a small streamable preview chunk used by the browser player for immediate playback, seeking, and UI smoke tests. It is not a replacement for the `BASE` stream.
 
-Current alpha files write `PVW1`, an RGB888 preview-video stream. The preview is intentionally tiny and decoder-friendly; production NVC playback still uses `BASE`, `MODL`, and later latent chunks.
+Current alpha files write `PVW2`, a sampled RGB888 preview-video stream. The preview is intentionally tiny and decoder-friendly; production NVC playback still uses `BASE`, `MODL`, and later latent chunks. The encoder stores roughly one tiny preview frame per second, capped by profile, while preserving the source frame count for timeline duration.
+
+```text
+offset  size  name
+0       4     magic = "PVW2"
+4       2     version = 2
+6       2     flags = 0
+8       4     preview width
+12      4     preview height
+16      4     fps numerator
+20      4     fps denominator
+24      4     source frame count
+28      4     stored preview frame count
+32      4     source frame stride between stored previews
+36      4     RGB bytes per stored preview frame
+40      N     packed sampled RGB888 preview frames
+```
+
+Older alpha files may contain `PVW1`, a full-rate RGB888 preview-video stream:
 
 ```text
 offset  size  name

@@ -129,6 +129,8 @@ export type PreviewInfo = {
   fpsNum: number;
   fpsDen: number;
   frameCount: number;
+  storedFrameCount?: number;
+  frameStride?: number;
 };
 
 export type TocEntry = {
@@ -814,6 +816,18 @@ export function getPreviewInfo(file: NvcFile): PreviewInfo | null {
       frameCount: view.getUint32(24, true),
     };
   }
+  if (magic === "PVW2") {
+    if (payload.length < 40) throw new Error("Invalid PVW2 payload");
+    return {
+      width: view.getUint32(8, true),
+      height: view.getUint32(12, true),
+      fpsNum: view.getUint32(16, true),
+      fpsDen: view.getUint32(20, true),
+      frameCount: view.getUint32(24, true),
+      storedFrameCount: view.getUint32(28, true),
+      frameStride: view.getUint32(32, true),
+    };
+  }
   return null;
 }
 
@@ -835,6 +849,26 @@ function decodePreviewRgb(file: NvcFile, frameIndex = 0): BaseRgbFrame | null {
       width,
       height,
       rgb: new Uint8ClampedArray(payload.slice(20, 20 + rgbSize)),
+    };
+  }
+  if (magic === "PVW2") {
+    if (payload.length < 40) throw new Error("Invalid PVW2 payload");
+    const width = view.getUint32(8, true);
+    const height = view.getUint32(12, true);
+    const sourceFrameCount = view.getUint32(24, true);
+    const storedFrameCount = view.getUint32(28, true);
+    const frameStride = Math.max(1, view.getUint32(32, true));
+    const frameBytes = view.getUint32(36, true);
+    if (sourceFrameCount < 1 || storedFrameCount < 1) throw new Error("Invalid PVW2 frame count");
+    if (frameBytes !== width * height * 3) throw new Error("Invalid PVW2 frame size");
+    const targetFrame = Math.max(0, Math.min(sourceFrameCount - 1, Math.trunc(frameIndex)));
+    const storedIndex = Math.max(0, Math.min(storedFrameCount - 1, Math.round(targetFrame / frameStride)));
+    const start = 40 + storedIndex * frameBytes;
+    if (payload.length < start + frameBytes) throw new Error("Truncated PVW2 frame data");
+    return {
+      width,
+      height,
+      rgb: new Uint8ClampedArray(payload.slice(start, start + frameBytes)),
     };
   }
   if (magic !== "PVW1") return null;

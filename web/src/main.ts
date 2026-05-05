@@ -234,6 +234,16 @@ player.addEventListener("ready", (event) => {
     dd.textContent = String(value);
     metadata.append(dt, dd);
   }
+  if (preview) {
+    appendMetadataObject("preview", {
+      width: preview.width,
+      height: preview.height,
+      fps: previewFps(preview).toFixed(3),
+      source_frames: preview.frameCount,
+      stored_frames: preview.storedFrameCount ?? preview.frameCount,
+      frame_stride: preview.frameStride ?? 1,
+    });
+  }
   if (parsed.model) {
     for (const [key, value] of Object.entries(parsed.model)) {
       if (value === undefined) continue;

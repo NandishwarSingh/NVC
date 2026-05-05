@@ -234,7 +234,8 @@ fn cmdEncode(args: []const []const u8) !void {
 
     const head = try buildHeadPayload(profile, probe, base_dims.width, base_dims.height, frame_count);
     defer allocator.free(head);
-    const prvw = try buildPreviewPayload(trimmed_raw, base_dims.width, base_dims.height, frame_count, probe.fps_num, probe.fps_den, 160);
+    const preview_settings = choosePreviewSettings(profile);
+    const prvw = try buildPreviewPayload(trimmed_raw, base_dims.width, base_dims.height, frame_count, probe.fps_num, probe.fps_den, preview_settings.max_width, preview_settings.max_frames);
     defer allocator.free(prvw);
     const modl = try loadModelPayload(model_path);
     defer allocator.free(modl);
@@ -701,6 +702,13 @@ fn chooseBaseGopSize(profile: Profile) u32 {
     };
 }
 
+fn choosePreviewSettings(profile: Profile) struct { max_width: u32, max_frames: u32 } {
+    return switch (profile) {
+        .w1 => .{ .max_width = 96, .max_frames = 90 },
+        .xc => .{ .max_width = 48, .max_frames = 30 },
+    };
+}
+
 fn evenAtLeast2(value: u32) u32 {
     var out = if (value < 2) 2 else value;
     if (out % 2 == 1) out -= 1;
@@ -1106,7 +1114,7 @@ fn buildBasePayload(raw: []const u8, width: u32, height: u32, fps_num: u32, fps_
     };
 }
 
-fn buildPreviewPayload(raw: []const u8, width: u32, height: u32, frame_count: u32, fps_num: u32, fps_den: u32, max_width: u32) ![]u8 {
+fn buildPreviewPayload(raw: []const u8, width: u32, height: u32, frame_count: u32, fps_num: u32, fps_den: u32, max_width: u32, max_preview_frames: u32) ![]u8 {
     const y_size: usize = @as(usize, width) * @as(usize, height);
     const uv_width = width / 2;
     const uv_height = height / 2;
@@ -1119,23 +1127,33 @@ fn buildPreviewPayload(raw: []const u8, width: u32, height: u32, frame_count: u3
     const preview_height = evenU32(scaled_height);
     const frame_bytes: usize = @as(usize, preview_width) * @as(usize, preview_height) * 3;
     const frames_available: u32 = @intCast(raw.len / frame_size);
-    const preview_frames = @min(frame_count, frames_available);
+    const source_frames = @min(frame_count, frames_available);
+    if (source_frames == 0) return error.InvalidBasePayload;
+    const safe_fps_num = if (fps_num == 0) 1 else fps_num;
+    const safe_fps_den = if (fps_den == 0) 1 else fps_den;
+    const one_per_second = @max(1, @as(u32, @intCast((@as(u64, source_frames) * safe_fps_den + safe_fps_num - 1) / safe_fps_num)));
+    const target_preview_frames = @max(1, @min(max_preview_frames, one_per_second));
+    const frame_stride = @max(1, ceilDivU32(source_frames, target_preview_frames));
+    const preview_frames = ceilDivU32(source_frames, frame_stride);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    try out.appendSlice(allocator, "PVW1");
-    try appendU16(&out, 1);
+    try out.appendSlice(allocator, "PVW2");
+    try appendU16(&out, 2);
     try appendU16(&out, 0);
     try appendU32(&out, preview_width);
     try appendU32(&out, preview_height);
     try appendU32(&out, fps_num);
     try appendU32(&out, fps_den);
+    try appendU32(&out, source_frames);
     try appendU32(&out, preview_frames);
+    try appendU32(&out, frame_stride);
     try appendU32(&out, @intCast(frame_bytes));
 
-    var frame: u32 = 0;
-    while (frame < preview_frames) : (frame += 1) {
-        const offset = @as(usize, frame) * frame_size;
+    var preview_frame: u32 = 0;
+    while (preview_frame < preview_frames) : (preview_frame += 1) {
+        const source_frame = @min(source_frames - 1, preview_frame * frame_stride);
+        const offset = @as(usize, source_frame) * frame_size;
         const first_frame = raw[offset .. offset + frame_size];
         const y_plane = first_frame[0..y_size];
         const u_plane = first_frame[y_size .. y_size + uv_size];
@@ -2592,6 +2610,26 @@ test "BAS5 packetized entropy motion transform base roundtrip dimensions" {
     try std.testing.expectEqual(@as(u32, 2), base.gop_size);
     try std.testing.expectEqual(@as(u32, 2), base.packet_count);
     try std.testing.expect(built.coded_size > 0);
+}
+
+test "PVW2 preview caps stored frames" {
+    const width: u32 = 16;
+    const height: u32 = 16;
+    const frame_count: u32 = 10;
+    const frame_size = yuv420FrameSize(width, height);
+    const raw = try allocator.alloc(u8, frame_size * frame_count);
+    defer allocator.free(raw);
+    for (raw, 0..) |*byte, i| {
+        byte.* = @intCast((i * 11 + 7) % 256);
+    }
+
+    const payload = try buildPreviewPayload(raw, width, height, frame_count, 10, 3, 8, 3);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.eql(u8, payload[0..4], "PVW2"));
+    try std.testing.expectEqual(@as(u32, frame_count), readU32(payload[24..28]));
+    try std.testing.expectEqual(@as(u32, 3), readU32(payload[28..32]));
+    try std.testing.expectEqual(@as(u32, 4), readU32(payload[32..36]));
 }
 
 test "FET1 feature residual payload roundtrip" {
