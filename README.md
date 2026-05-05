@@ -1,8 +1,20 @@
 # NVC: Neural Video Codec
 
+## By the numbers
+
+Current alpha benchmark snapshots:
+
+- **16 hours of 1024x576 natural video can fit in roughly 325 MB** at the measured XC rate of about 5.6 KB/s.
+- **21x smaller than a source MP4** on the WhatsApp test clip: 6.78 MB source to 314 KB `.nvc`.
+- **9x smaller W1 base stream** in the BAS5 to BAS6 transition benchmark, with VMAF around 85 on synthetic test content.
+- **+10.6 VMAF from `--enhancer realesrgan`** on W1 natural content in the FourPeople benchmark.
+- **12 fps base to 30 fps output** is supported with `--interpolate-rife` for smoother XC CLI decode.
+
+See [STATS.md](STATS.md) for methodology, exact commands, and the reproducibility script.
+
 NVC is an experimental custom video codec with its own `.nvc` file type. The goal is to compress video by storing a small low-resolution base stream plus neural data that helps reconstruct a visually accurate full-resolution video.
 
-This repo is an alpha implementation. It already creates and reads native `.nvc` files, includes a Zig CLI, includes a browser demo, and lays down the format/spec structure for the neural codec work.
+This repo is an alpha implementation. It already creates and reads native `.nvc` files, includes a Zig CLI, includes a browser demo, and lays down the format/spec structure for the neural codec work. New here? Start with [HOW_TO_SETUP_FROM_SCRATCH.md](HOW_TO_SETUP_FROM_SCRATCH.md).
 
 ## What Is NVC?
 
