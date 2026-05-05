@@ -694,31 +694,24 @@ function planarFloatToImageData(data: Float32Array, w: number, h: number): Image
   return new ImageData(out, w, h);
 }
 
-// Pre-downscale the base to half its width so the x4 model effectively gives x2 reconstruction
-// at the source resolution, matching what realesrgan-ncnn-vulkan -s 2 produces in the CLI.
-function halveBaseFrame(base: BaseRgbFrame): BaseRgbFrame {
-  const dstW = Math.max(2, base.width >> 1);
-  const dstH = Math.max(2, base.height >> 1);
-  const out = new Uint8ClampedArray(dstW * dstH * 3);
-  for (let y = 0; y < dstH; y += 1) {
-    const sy0 = Math.min(base.height - 1, y * 2);
-    const sy1 = Math.min(base.height - 1, sy0 + 1);
-    for (let x = 0; x < dstW; x += 1) {
-      const sx0 = Math.min(base.width - 1, x * 2);
-      const sx1 = Math.min(base.width - 1, sx0 + 1);
-      const dst = (y * dstW + x) * 3;
-      for (let c = 0; c < 3; c += 1) {
-        out[dst + c] = Math.round(
-          (base.rgb[(sy0 * base.width + sx0) * 3 + c] +
-            base.rgb[(sy0 * base.width + sx1) * 3 + c] +
-            base.rgb[(sy1 * base.width + sx0) * 3 + c] +
-            base.rgb[(sy1 * base.width + sx1) * 3 + c]) /
-            4,
-        );
-      }
-    }
-  }
-  return { width: dstW, height: dstH, rgb: out };
+// Resize an ImageData to (dstW, dstH) using the browser's hardware-accelerated bicubic
+// drawImage. Used to bring the x4 model output back down to source resolution after SR
+// (matches what `ffmpeg -vf scale=...:flags=lanczos` does in the CLI realesrgan path).
+function resizeImageData(src: ImageData, dstW: number, dstH: number): ImageData {
+  if (src.width === dstW && src.height === dstH) return src;
+  const Ctor = (globalThis as { OffscreenCanvas?: typeof OffscreenCanvas }).OffscreenCanvas;
+  if (!Ctor) return src;
+  const c1 = new Ctor(src.width, src.height);
+  const ctx1 = c1.getContext("2d");
+  if (!ctx1) return src;
+  ctx1.putImageData(src, 0, 0);
+  const c2 = new Ctor(dstW, dstH);
+  const ctx2 = c2.getContext("2d");
+  if (!ctx2) return src;
+  ctx2.imageSmoothingEnabled = true;
+  ctx2.imageSmoothingQuality = "high";
+  ctx2.drawImage(c1, 0, 0, dstW, dstH);
+  return ctx2.getImageData(0, 0, dstW, dstH);
 }
 
 export async function decodeNeuralFrameOnnx(
@@ -728,13 +721,14 @@ export async function decodeNeuralFrameOnnx(
 ): Promise<NeuralRenderResult> {
   const ort = await loadOrt();
   const session = (await getRealEsrganSession()) as InstanceType<OrtNamespace["InferenceSession"]>;
+  // CLI parity: realesrgan-ncnn-vulkan runs at the full base resolution. Anything we strip
+  // off the input is detail Real-ESRGAN can never recover. Run the x4 model at native base
+  // dims, then bicubic-downsample the output to source res — same arrangement as the CLI's
+  //   `... -s 2 ...` (which is internally `x4 weights -> downscale by 2`)  but without the
+  // earlier halve-input shortcut that was bottlenecking quality.
   const fullBase = decodeFirstBaseRgb(file, frameIndex, !(options.preferCodecInput ?? false));
-  // The shipped weights are x4. For W1's natural x2 use case we halve the base on input so
-  // model output lands at source resolution (x2 effective). For lower-ratio bases the canvas
-  // CSS-fits whatever we produce.
-  const base = halveBaseFrame(fullBase);
-  const planar = rgbToPlanarFloat(base.rgb, base.width, base.height);
-  const tensor = new ort.Tensor("float32", planar, [1, 3, base.height, base.width]);
+  const planar = rgbToPlanarFloat(fullBase.rgb, fullBase.width, fullBase.height);
+  const tensor = new ort.Tensor("float32", planar, [1, 3, fullBase.height, fullBase.width]);
   const feeds: Record<string, InstanceType<OrtNamespace["Tensor"]>> = {};
   feeds[REALESRGAN_INPUT_NAME] = tensor;
   const out = await session.run(feeds);
@@ -744,15 +738,29 @@ export async function decodeNeuralFrameOnnx(
   const outH = Number(dims[2]);
   const outW = Number(dims[3]);
   const outData = outTensor.data as Float32Array;
-  const imageData = planarFloatToImageData(outData, outW, outH);
-  applyReconstructionTuning(file, imageData, frameIndex, fullBase);
+  let imageData = planarFloatToImageData(outData, outW, outH);
+
+  // Match the CLI: ffmpeg-style lanczos resize from x4 model output to source dims, so the
+  // canvas displays a source-resolution frame rather than an over-large one CSS shrinks.
+  const sourceW = Math.max(1, Number(file.head.width || 0)) || outW;
+  const sourceH = Math.max(1, Number(file.head.height || 0)) || outH;
+  if (outW !== sourceW || outH !== sourceH) {
+    imageData = resizeImageData(imageData, sourceW, sourceH);
+  }
+
+  // Intentionally skip `applyReconstructionTuning` here. That helper blends 72% base luma
+  // into the SR output (`applyCodecBaseGuide`) which made sense for the tiny TinySR model
+  // (~5K params, weak luma) but actively dilutes Real-ESRGAN's recovered detail with VP9
+  // codec artifacts. The CLI's `--enhancer realesrgan` path doesn't apply FET1/COL1/GRN1
+  // either; it just outputs realesrgan's frames straight to libx264. CLI parity wins here.
+
   return {
     imageData,
     backend: ortBackendUsed === "webgpu" ? "webgpu" : "cpu",
-    inputWidth: base.width,
-    inputHeight: base.height,
-    outputWidth: outW,
-    outputHeight: outH,
+    inputWidth: fullBase.width,
+    inputHeight: fullBase.height,
+    outputWidth: imageData.width,
+    outputHeight: imageData.height,
     fallbackReason: ortBackendUsed === "wasm" ? "WebGPU unavailable; running on WASM" : undefined,
   };
 }

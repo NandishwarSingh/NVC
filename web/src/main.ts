@@ -181,8 +181,8 @@ export class NVCPlayer extends EventTarget {
         backend = neural.backend;
         fallbackReason = neural.fallbackReason;
         // Cache only the still-frame Neural output (saves the 100ms+ ORT round-trip on re-seek).
-        // Limit cache size so very long clips don't blow up memory.
-        if (this.neuralFrameCache.size < 240) this.neuralFrameCache.set(this.frameIndex, firstFrame);
+        // Cap is conservative because each frame is now at source resolution (e.g. 1080p ≈ 8 MB).
+        if (this.neuralFrameCache.size < 60) this.neuralFrameCache.set(this.frameIndex, firstFrame);
       }
     } else if (effective === "codec") {
       const cached = this.codecFrameCache.get(this.frameIndex);
